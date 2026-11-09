@@ -8,8 +8,11 @@
 - 二维码判定与 wxmoments.detect_qrcode 同一标准：
   能解码出内容；或定位点四点近正方形（透视容差 25%）且面积占比 2%~60%（艺术码/点状码）
 - 手机号判定：OCR 文本（去空格/横线后）匹配 1[3-9]\\d{9}
-- 单进程串行执行（避免多份模型内存叠加导致 OpenCV 分配失败）；结果按 (相对路径,大小) 缓存，重跑同一批不重复检测
-- 内容完全相同的图片只检测一次（分块 md5，仅对大小相同者计算）
+- OCR 前把长边缩到 _OCR_MAX_SIDE（默认 1280）：RapidOCR 检测默认只放大小图、
+  不缩小大图，商品大图会按原分辨率推理；缩放后单图耗时约降一半，手机号仍可识别
+- 2 路线程并行、共享同一份 OCR 引擎：多进程会让每进程的 ONNX Runtime 各自吃满线程，
+  实测反而比串行更慢，故不使用多进程
+- 结果按 (相对路径,大小) 缓存，重跑同一批不重复检测；内容完全相同的图片只检测一次
 - 依赖缺失时优雅降级：无 opencv 跳过二维码检测，无 rapidocr 跳过手机号检测
 """
 
@@ -19,6 +22,8 @@ import hashlib
 import json
 import re
 import sys
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 # 前后不能再跟数字：避免 EAN-13 条码（69开头13位）等长数字串的 11 位子串误命中
@@ -33,6 +38,14 @@ _NP = None
 _OCR = None
 _CLS_DISABLED = False  # 是否已关闭角度分类器（手机号只需正排文字，关闭省推理）
 _INIT_DONE = False
+
+# OCR 输入长边上限：RapidOCR 检测默认 limit_type=min，只会放大小图、不会缩小大图，
+# 商品图动辄 2000px 以上，缩到 1280 后单图耗时约为原来的 1/2，手机号仍可识别。
+_OCR_MAX_SIDE = 1280
+# 共享单引擎的并行线程数：实测 2 路约 1.5x，再加线程收益递减且会与下载抢 CPU。
+_OCR_THREADS = 2
+# cv2.QRCodeDetector 非线程安全，按线程复用实例。
+_QR_LOCAL = threading.local()
 
 
 def _init_worker() -> None:
@@ -91,7 +104,10 @@ def _is_qrcode(gray) -> bool:
     if max(h, w) > 800:
         scale = 800.0 / max(h, w)
         gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-    detector = cv2.QRCodeDetector()
+    detector = getattr(_QR_LOCAL, "detector", None)
+    if detector is None:
+        detector = cv2.QRCodeDetector()
+        _QR_LOCAL.detector = detector
     data, points, _straight = detector.detectAndDecode(gray)
     if data:
         return True
@@ -156,6 +172,14 @@ def _inspect_one(path_str: str) -> tuple[str, bool, list[str], str]:
     if _OCR is not None and img is not None and not is_qr:
         # 二维码图一定会被隔离，无需再做 OCR，省一次完整识别开销
         try:
+            h, w = img.shape[:2]
+            if max(h, w) > _OCR_MAX_SIDE:
+                scale = _OCR_MAX_SIDE / max(h, w)
+                img = _CV2.resize(
+                    img,
+                    (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                    interpolation=_CV2.INTER_AREA,
+                )
             result, _elapse = _OCR(img)
         except Exception:
             result = None
@@ -219,6 +243,49 @@ def _content_digest(path: Path) -> str:
         return ""
 
 
+class BackgroundInspector:
+    """导出阶段后台并行 OCR，结果写入与 inspect_images 相同的缓存。
+
+    每落盘一张商品图就 submit 一次，OCR 与后续下载重叠；导出结束 close() 等待
+    剩余任务并落盘。之后清洗阶段调用 inspect_images 时直接命中缓存，不再重复识别。
+    """
+
+    def __init__(self, cache_path: Path | None, root: Path | None, workers: int = _OCR_THREADS) -> None:
+        self._cache_path = cache_path
+        self._root = root.resolve() if root is not None else None
+        self._executor = ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="img-prefetch")
+        self._lock = threading.Lock()
+        self._cache = _load_cache(cache_path)
+        self._submitted: set[str] = set()
+        self._futures: list[Future] = []
+        _init_worker()  # 主线程先加载引擎，避免多个工作线程同时初始化
+
+    def submit(self, path: Path) -> None:
+        p = Path(path)
+        key = _cache_key(p, self._root)
+        with self._lock:
+            if key in self._cache or key in self._submitted:
+                return
+            self._submitted.add(key)
+        future = self._executor.submit(_inspect_one, str(p))
+        future.add_done_callback(lambda fut, k=key: self._on_done(k, fut))
+        self._futures.append(future)
+
+    def _on_done(self, key: str, future: Future) -> None:
+        try:
+            result = future.result()
+        except Exception:
+            return
+        with self._lock:
+            self._cache[key] = [result[1], result[2], result[3]]
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=True)
+        with self._lock:
+            _save_cache(self._cache_path, self._cache)
+        self._futures.clear()
+
+
 def inspect_images(
     paths: list[Path],
     cache_path: Path | None = None,
@@ -227,8 +294,8 @@ def inspect_images(
     """批量检测图片，返回 {路径字符串: {"qrcode": bool, "phones": [...], "sample": str}}。
 
     root 用于生成跨批次稳定的缓存键（相对路径+文件大小），缺省退回绝对路径。
-    单进程串行检测：OCR 为 CPU 密集，但多进程会各自加载一份模型与 OpenCV，
-    内存叠加曾导致 OpenCV 分配失败中断整批，故固定串行。
+    同进程 _OCR_THREADS 路并行、共享一份 OCR 引擎；多进程会各自加载模型并让
+    每进程的 ONNX Runtime 各自吃满线程，实测比串行更慢，故不采用。
     """
     uniq: list[Path] = []
     seen: set[str] = set()
@@ -292,7 +359,7 @@ def inspect_images(
     print(
         f"  图片内容检测: {total} 张待检测（缓存命中 {len(results)} 张"
         + (f"，内容重复 {duplicated} 张" if duplicated else "")
-        + "），单进程串行",
+        + f"），{_OCR_THREADS} 路并行",
         flush=True,
     )
 
@@ -309,10 +376,15 @@ def inspect_images(
             }
 
     _init_worker()
-    for i, (p, ck) in enumerate(detect, 1):
-        r = _inspect_one(str(p))
-        _absorb(r[0], r[1], r[2], r[3], ck)
-        if i % 50 == 0 or i == total:
-            print(f"    检测进度 {i}/{total}", flush=True)
+
+    def _run(item: tuple[Path, str]) -> tuple[str, tuple]:
+        p, ck = item
+        return ck, _inspect_one(str(p))
+
+    with ThreadPoolExecutor(max_workers=_OCR_THREADS, thread_name_prefix="img-inspect") as executor:
+        for i, (ck, r) in enumerate(executor.map(_run, detect), 1):
+            _absorb(r[0], r[1], r[2], r[3], ck)
+            if i % 50 == 0 or i == total:
+                print(f"    检测进度 {i}/{total}", flush=True)
     _save_cache(cache_path, cache)
     return results

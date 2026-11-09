@@ -30,6 +30,9 @@ import httpx
 from .logging_config import get_logger
 
 logger = get_logger(__name__)
+# 下载重试：只对临时性错误重试，避免 4xx 反复打 CDN
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+_RETRY_BACKOFF = 0.3
 _MODULE_DIR = Path(__file__).resolve().parent
 _PACKAGE_DIR = _MODULE_DIR.parent if _MODULE_DIR.name == "modules" else _MODULE_DIR
 _NATIVE_DIR = _PACKAGE_DIR / "native"
@@ -368,10 +371,24 @@ async def _download_sns_remote_to_file(
                     f.write(chunk)
         return content_type, x_enc
 
+    async def download_with_retry(http_client: httpx.AsyncClient) -> tuple[str, str]:
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                return await download(http_client)
+            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+                if isinstance(exc, httpx.HTTPStatusError):
+                    if exc.response.status_code not in _RETRYABLE_STATUS:
+                        raise
+                last_exc = exc
+                await asyncio.sleep(_RETRY_BACKOFF * (2 ** attempt))
+        assert last_exc is not None
+        raise last_exc
+
     if client is not None:
-        return await download(client)
+        return await download_with_retry(client)
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as owned_client:
-        return await download(owned_client)
+        return await download_with_retry(owned_client)
 
 
 def maybe_decrypt_sns_video_file(path: Path, key: str) -> bool:
@@ -654,10 +671,24 @@ async def _download_sns_remote_bytes(
         x_enc = str(resp.headers.get("x-enc") or "").strip()
         return payload, content_type, x_enc
 
+    async def download_with_retry(http_client: httpx.AsyncClient) -> tuple[bytes, str, str]:
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                return await download(http_client)
+            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+                if isinstance(exc, httpx.HTTPStatusError):
+                    if exc.response.status_code not in _RETRYABLE_STATUS:
+                        raise
+                last_exc = exc
+                await asyncio.sleep(_RETRY_BACKOFF * (2 ** attempt))
+        assert last_exc is not None
+        raise last_exc
+
     if client is not None:
-        return await download(client)
+        return await download_with_retry(client)
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as owned_client:
-        return await download(owned_client)
+        return await download_with_retry(owned_client)
 
 
 @dataclass(frozen=True)
