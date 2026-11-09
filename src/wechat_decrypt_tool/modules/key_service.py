@@ -444,34 +444,30 @@ def _get_db_key_with_v4(
     except Exception as e:
         raise RuntimeError("pymem 模块未安装，无法执行 V4 内存扫描") from e
 
-    errors: list[str] = []
-    pid = None
-    process_name_used = ""
-    for process_name in WECHAT_EXECUTABLE_NAMES:
+    # 微信是多进程架构，只有主进程持有数据库密钥。
+    # pymem 按进程名只匹配首个进程，可能命中无密钥的子进程（GPU/渲染等），
+    # 故枚举全部候选进程，按内存占用降序（主进程通常最大）依次尝试。
+    process_names_lower = {n.lower() for n in WECHAT_EXECUTABLE_NAMES}
+    process_candidates: list[tuple[int, int, str]] = []  # (内存字节数, pid, 进程名)
+    for proc in psutil.process_iter(["pid", "name", "memory_info"]):
         try:
-            pm = _pymem.Pymem(process_name)
-            pid = pm.process_id
-            process_name_used = process_name
-            break
-        except Exception as e:
-            errors.append(f"{process_name}: {e}")
+            name = str(proc.info["name"] or "")
+            if name.lower() not in process_names_lower:
+                continue
+            mem_info = proc.info["memory_info"]
+            process_candidates.append((mem_info.rss if mem_info else 0, proc.info["pid"], name))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
 
-    if not pid:
-        raise RuntimeError("未找到运行中的微信进程：" + "; ".join(errors))
-
-    logger.info(
-        "[db_key_v4] 调用单文件扫描器: module=%s process=%s pid=%s probe_db=%s",
-        getattr(key_v4_module, "__file__", "key_v4"),
-        process_name_used,
-        pid,
-        str(probe_db_path),
-    )
+    if not process_candidates:
+        raise RuntimeError("未找到运行中的微信进程：" + "/".join(WECHAT_EXECUTABLE_NAMES))
+    process_candidates.sort(reverse=True)
 
     last_errors: list[str] = []
     recovered_key = ""
     used_internal_db_key_source = ""
 
-    def _try_recover(candidate_internal_db_key: bytes, source: str) -> str:
+    def _try_recover(candidate_internal_db_key: bytes, source: str, pid: int) -> str:
         if hasattr(key_v4_module, "finish_flag"):
             try:
                 key_v4_module.finish_flag = False
@@ -482,7 +478,8 @@ def _get_db_key_with_v4(
         else:
             current_raw_key = key_v4_module.recover_key(pid, str(probe_db_path))
         logger.info(
-            "[db_key_v4] 单文件扫描器返回结果: type=%s has_value=%s candidate_internal_db_key_len=%s source=%s",
+            "[db_key_v4] 单文件扫描器返回结果: pid=%s type=%s has_value=%s candidate_internal_db_key_len=%s source=%s",
+            pid,
             type(current_raw_key).__name__,
             bool(current_raw_key),
             len(candidate_internal_db_key),
@@ -497,16 +494,26 @@ def _get_db_key_with_v4(
         return current_key
 
     tried: list[str] = []
-    for candidate_internal_db_key, source in candidate_plan:
-        try:
-            tried.append(f"{source}:len={len(candidate_internal_db_key)}")
-            recovered_key = _try_recover(candidate_internal_db_key, source)
-            used_internal_db_key_source = source if candidate_internal_db_key else ""
+    for mem_bytes, pid, process_name_used in process_candidates:
+        logger.info(
+            "[db_key_v4] 尝试进程: process=%s pid=%s mem=%dMB probe_db=%s",
+            process_name_used,
+            pid,
+            mem_bytes // 1048576,
+            str(probe_db_path),
+        )
+        for candidate_internal_db_key, source in candidate_plan:
+            try:
+                tried.append(f"pid={pid}/{source}:len={len(candidate_internal_db_key)}")
+                recovered_key = _try_recover(candidate_internal_db_key, source, pid)
+                used_internal_db_key_source = source if candidate_internal_db_key else ""
+                break
+            except Exception as e:
+                last_errors.append(f"pid={pid}: {e}")
+                recovered_key = ""
+                continue
+        if recovered_key:
             break
-        except Exception as e:
-            last_errors.append(str(e))
-            recovered_key = ""
-            continue
 
     if not recovered_key:
         raise RuntimeError("V4 内存扫描失败：" + ("; ".join(last_errors) if last_errors else "未找到有效密钥"))

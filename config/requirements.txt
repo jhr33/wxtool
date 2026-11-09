@@ -1,5 +1,8 @@
 cryptography
 httpx
+numpy
+openpyxl
+opencv-python-headless
 pefile
 pillow
 pilk
@@ -7,6 +10,7 @@ psutil
 pycryptodome
 pymem; platform_system == "Windows"
 pywin32; platform_system == "Windows"
+rapidocr-onnxruntime
 reportlab
 requests
 yara-python; platform_system == "Windows"

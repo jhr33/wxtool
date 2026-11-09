@@ -12,9 +12,10 @@ import re
 import shutil
 import sqlite3
 import sys
+import traceback
 from io import BytesIO
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -74,9 +75,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--key", default="", help=argparse.SUPPRESS)
     parser.add_argument("--start", default="", help="起始时间，例如 20260606；留空表示不限制")
     parser.add_argument("--end", default="", help="终止时间，例如 20260606；留空表示不限制")
-    parser.add_argument("--only-self", default="", help="是否只导出自己的朋友圈: y/n，默认 y")
+    parser.add_argument("--only-self", default="", help="是否只导出自己的朋友圈: y/n，默认 y（y=只自己，n=自己+好友）")
+    parser.add_argument("--export-scope", default="", help="导出范围: self(只自己)/friends(只好友)/all(自己+好友)；优先于 --only-self")
     parser.add_argument("--keep-interactions", default="", help="是否保留点赞评论: y/n，默认 n")
     parser.add_argument("--export-contacts", default="", help="是否导出好友列表: y/n，默认 n")
+    parser.add_argument("--md-only", default="", help="是否只导出 Markdown 和图片（跳过 PDF）: y/n，默认 n")
+    parser.add_argument("--export-excel", default="", help="是否导出 Excel 表格（moments.xlsx）: y/n，默认 y")
+    parser.add_argument("--clean-data", default="", help="是否清洗数据（剔除无图/非商品，生成 moments_clean.xlsx）: y/n，默认 n")
+    parser.add_argument("--skip-non-product", default="", help="下载前预判，非商品朋友圈跳过图片下载（省流量/OSS）: y/n，默认 y")
+    parser.add_argument("--skip-qrcode", default="", help="跳过含二维码的商品图（先取缩略图检测，命中不下载原图）: y/n，默认 y")
+    parser.add_argument("--image-inspect", default="", help="清洗第三阶段：对已下载图片做二维码+OCR手机号检测，命中图隔离、无图商品剔除: y/n，默认 y")
+    parser.add_argument("--export-merchant", default="", help="是否导出商家导入表格（商家导入.xlsx）: y/n，默认 n")
+    parser.add_argument("--export-type", default="", help="导出类型: friends(好友/商家表格)/moments(朋友圈商品)；交互模式可直接选择，CLI 不填默认 moments")
+    parser.add_argument("--merchant-template", default="", help="商家导入模板路径，默认 config/商家导入模板.xlsx")
+    parser.add_argument("--friend-filter-mode", default="", help="好友筛选方式: all(全部)/prefix(按前缀)/manual(手动)；仅在导出范围为 friends/all 时生效")
+    parser.add_argument("--friend-prefix", default="", help="按好友备注名前缀筛选导出，例如 服装")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help=argparse.SUPPRESS)
     parser.add_argument("--output-root", default="", help=argparse.SUPPRESS)
     parser.add_argument("--no-download", action="store_true", help=argparse.SUPPRESS)
@@ -108,22 +121,36 @@ def ensure_imports() -> None:
     raise FileNotFoundError("缺少 src/wechat_decrypt_tool，请确认项目文件完整")
 
 
+class RestartFlow(Exception):
+    """用户在任意输入处输入 r，要求放弃本次、从头重新开始。"""
+
+
 def ask_input(value: str, label: str, default: str = "") -> str:
     if value:
         return value.strip()
     suffix = f" [{default}]" if default else ""
-    return input(f"{label}{suffix}: ").strip() or default
+    answer = input(f"{label}{suffix}: ").strip()
+    if answer.lower() in {"r", "reset"}:
+        raise RestartFlow
+    return answer or default
 
 
 def print_input_rules() -> None:
     print(
         "\n输入规则：\n"
+        "- 第一步选择导出类型：d=默认导出（昨天+库存联盟，图片+清洗表格）；"
+        "f=好友/商家表格（contacts.csv + 商家导入.xlsx，不导出朋友圈）；"
+        "m=朋友圈商品（moments.md/图片/PDF/Excel）。直接回车表示 d。\n"
+        "- 朋友圈商品模式：先选时间范围与导出范围（s=只自己；f=只好友；a=全部，回车=s），再按需筛选好友。\n"
+        "- 好友/商家模式：先选好友筛选方式，再决定是否导出好友列表与商家导入表格。\n"
         "- 时间格式示例：20260606 或 2026-06-06；直接回车表示不限制。\n"
-        "- 是否只导出自己的朋友圈：请输入 y 或 n；直接回车表示 y。\n"
-        "- 是否保留点赞评论：请输入 y 或 n；直接回车表示 n。\n"
-        "- 是否导出好友列表：请输入 y 或 n；直接回车表示 n。\n"
-        "- 如果选择 n，可以继续按好友备注或昵称筛选。\n"
-        "- 好友筛选：第1位直接回车表示导出所有人；输入 /me 表示自己；输入 /enough 表示结束选择。\n",
+        "- 图片下载前会询问是否清洗识别手机号：y（默认）=下载后检测二维码/手机号并隔离命中图片；n=不检测，仅保留下载时的二维码快检。\n"
+        "- 好友筛选方式：a=全部好友；p=按备注关键词筛选（输入 服装 或 库存联盟 等，匹配备注中包含该词的好友）；m=手动逐个选择。直接回车默认 a。\n"
+        "- 任意输入处输入 r 回车 = 放弃本次、从头重新开始（包括时间/筛选/导出类型）。\n"
+        "- 导出中途出错不会退出程序，自动回到开头；结束时输入 q 可退出。\n"
+        "- 商家导入表格含商家名称/手机号(备注末尾)/微信号/省市区；地区缺省时自动补“市辖区”，无地区默认浙江金华义乌。\n"
+        "- 手动选择：第1位直接回车表示导出所有人；输入 /me 表示自己；输入 /enough 表示结束选择。\n"
+        "- 批量粘贴：可一次粘贴多个好友的昵称或备注，用逗号（, 或，）、分号（; 或；）、顿号（、）、竖线（|）或换行分隔，自动识别并逐个匹配。\n",
         flush=True,
     )
 
@@ -163,6 +190,60 @@ def parse_yes_no_default_no(value: str) -> bool:
     if raw in {"n", "no", "0", "false", "off"}:
         return False
     raise ValueError("请输入 y 或 n")
+
+
+def parse_export_scope(value: str) -> str:
+    """Parse export scope into one of: self, friends, all."""
+    raw = str(value or "").strip().lower()
+    if raw in {"s", "self", "self_only"}:
+        return "self"
+    if raw in {"f", "friends", "friends_only"}:
+        return "friends"
+    if raw in {"a", "all"}:
+        return "all"
+    raise ValueError("导出范围请输入 s（只自己）、f（只好友）或 a（全部）")
+
+
+def ask_export_scope(cli_value: str = "") -> str:
+    """Determine export scope from CLI value or interactive prompt.
+
+    Returns one of: "self", "friends", "all". Defaults to "self" on empty
+    input.
+    """
+    scope = str(cli_value or "").strip().lower()
+    valid = {
+        "s": "self", "self": "self",
+        "f": "friends", "friends": "friends",
+        "a": "all", "all": "all",
+    }
+    if scope in valid:
+        return valid[scope]
+    while True:
+        raw = input(
+            "请选择导出范围（s=只导出自己，f=只导出好友，"
+            "a=全部(自己+好友)；回车=s）: "
+        ).strip().lower()
+        if not raw:
+            return "self"
+        if raw in valid:
+            return valid[raw]
+        print("输入无效，请输入 s、f 或 a。", flush=True)
+
+
+def resolve_scope_from_args(args: argparse.Namespace, *, use_cli_args: bool) -> str:
+    """Resolve export scope from CLI args.
+
+    --export-scope takes precedence; otherwise --only-self is mapped
+    (y -> self, n -> all). Returns "" when neither CLI arg is set, so the
+    caller can prompt interactively.
+    """
+    if not use_cli_args:
+        return ""
+    if args.export_scope:
+        return parse_export_scope(args.export_scope)
+    if args.only_self:
+        return "self" if parse_yes_no(args.only_self) else "all"
+    return ""
 
 
 def clean_account_name(path_name: str) -> str:
@@ -496,6 +577,24 @@ async def save_image_keys(account: str, wxid_dir: Path, db_storage_dir: Path) ->
 
     account_dir = OUTPUT_RUNTIME_DIR / "databases" / account
     account_dir.mkdir(parents=True, exist_ok=True)
+
+    # Reuse cached image keys if present and structurally valid. Image keys
+    # are per-WeChat-session and may change after a WeChat restart; if cached
+    # keys fail to decrypt images the export just logs missing-image warnings,
+    # so this trade-off keeps repeated exports fast.
+    keys_path = account_dir / "_media_keys.json"
+    if keys_path.exists():
+        try:
+            cached = json.loads(keys_path.read_text(encoding="utf-8"))
+            if isinstance(cached, dict) and "xor" in cached and "aes" in cached:
+                xor_key = int(cached["xor"])
+                aes_key = str(cached["aes"] or "")
+                if 0 <= xor_key <= IMAGE_XOR_KEY_MAX and len(aes_key) == IMAGE_AES_KEY_LENGTH:
+                    print(f"  复用已缓存的图片密钥: {keys_path}")
+                    return
+        except Exception:
+            pass
+
     data = await get_image_key_integrated_workflow(
         account,
         db_storage_path=str(db_storage_dir),
@@ -511,14 +610,61 @@ async def save_image_keys(account: str, wxid_dir: Path, db_storage_dir: Path) ->
     aes_key = str(data.get("aes_key") or "")[:16]
     if not (0 <= xor_key <= IMAGE_XOR_KEY_MAX) or len(aes_key) != IMAGE_AES_KEY_LENGTH:
         raise RuntimeError("图片密钥无效")
-    (account_dir / "_media_keys.json").write_text(
+    keys_path.write_text(
         json.dumps({"xor": xor_key, "aes": aes_key}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
 
+def _source_dbs_newer_than_cached(source_dir: Path, cached_dir: Path) -> bool:
+    """Return True if any source WeChat .db is newer than its cached copy.
+
+    WeChat rewrites its local databases when remarks change or new moments are
+    cached. Comparing modification times lets us skip re-decryption only when
+    the decrypted cache is still fresh.
+    """
+    try:
+        newest_source = 0.0
+        for db_file in source_dir.rglob("*.db"):
+            try:
+                mtime = db_file.stat().st_mtime
+                if mtime > newest_source:
+                    newest_source = mtime
+            except OSError:
+                continue
+        if newest_source <= 0:
+            return False
+        for cached_file in cached_dir.rglob("*.db"):
+            try:
+                if cached_file.stat().st_mtime < newest_source:
+                    return True
+            except OSError:
+                continue
+    except Exception:
+        return True  # be safe and re-decrypt on any error
+    return False
+
+
 def decrypt_databases(account_info: AccountInfo, key: str) -> Path:
     from wechat_decrypt_tool.modules.wechat_decrypt import decrypt_wechat_databases
+
+    # Reuse already-decrypted databases only if the cached copies are not older
+    # than the source WeChat databases. WeChat updates its local *.db files
+    # when remarks are edited or new moments are cached, so a stale cache would
+    # otherwise hide those changes.
+    existing_dir = OUTPUT_RUNTIME_DIR / "databases" / account_info.account
+    if (existing_dir / "sns.db").exists() and not _source_dbs_newer_than_cached(
+        account_info.db_storage_dir, existing_dir
+    ):
+        try:
+            conn = sqlite3.connect(str(existing_dir / "sns.db"))
+            conn.execute("SELECT 1 FROM SnsTimeLine LIMIT 1").fetchone()
+            conn.close()
+            print(f"  复用已解密的数据库: {existing_dir}")
+            return existing_dir
+        except Exception:
+            # Cached db is corrupt or key changed; fall through to re-decrypt.
+            pass
 
     result = decrypt_wechat_databases(db_storage_path=str(account_info.db_storage_dir), key=key)
     if str(result.get("status") or "").lower() not in {"success", "ok"}:
@@ -925,6 +1071,182 @@ def contact_is_current_friend(row: sqlite3.Row, table: str, self_usernames: set[
     return int_row_value(row, "local_type") == 1
 
 
+# ---------------------------------------------------------------------------
+# 好友资料地区：微信 4.x 把资料地区以 protobuf 存在 contact.extra_buffer，
+# field5=国家代码(CN)、field6=省份拼音(Guangdong)、field7=城市拼音(Guangzhou)。
+# ---------------------------------------------------------------------------
+
+# 省份/直辖市/自治区拼音 -> 中文简称
+_REGION_PROVINCE_PINYIN: dict[str, str] = {
+    "Beijing": "北京", "Shanghai": "上海", "Tianjin": "天津", "Chongqing": "重庆",
+    "Zhejiang": "浙江", "Jiangsu": "江苏", "Guangdong": "广东", "Anhui": "安徽",
+    "Henan": "河南", "Jiangxi": "江西", "Shandong": "山东", "Fujian": "福建",
+    "Hebei": "河北", "Hunan": "湖南", "Sichuan": "四川", "Hubei": "湖北",
+    "Shaanxi": "陕西", "Shanxi": "山西", "Heilongjiang": "黑龙江", "Jilin": "吉林",
+    "Liaoning": "辽宁", "Guizhou": "贵州", "Yunnan": "云南", "Gansu": "甘肃",
+    "Qinghai": "青海", "Hainan": "海南", "Guangxi": "广西", "Ningxia": "宁夏",
+    "Xinjiang": "新疆", "Inner Mongolia": "内蒙古", "Tibet": "西藏",
+    "Hong Kong": "香港", "Macao": "澳门", "Taiwan": "台湾",
+}
+_REGION_DIRECT_CITIES = {"北京", "上海", "天津", "重庆"}
+_REGION_AUTONOMOUS_SUFFIX = {
+    "广西": "广西壮族自治区", "宁夏": "宁夏回族自治区", "新疆": "新疆维吾尔自治区",
+    "内蒙古": "内蒙古自治区", "西藏": "西藏自治区",
+}
+
+# 地级市拼音 -> 中文简称
+_REGION_CITY_PINYIN: dict[str, str] = {
+    "Anqing": "安庆", "Anshan": "鞍山", "Anshun": "安顺", "Anyang": "安阳",
+    "Baoding": "保定", "Baoshan": "保山", "Baotou": "包头", "Binzhou": "滨州",
+    "Bozhou": "亳州", "Cangzhou": "沧州", "Changchun": "长春", "Changde": "常德",
+    "Changning": "常宁", "Changsha": "长沙", "Changzhou": "常州", "Chaozhou": "潮州",
+    "Chengdu": "成都", "Chenzhou": "郴州", "Chifeng": "赤峰", "Chizhou": "池州",
+    "Chuzhou": "滁州", "Dalian": "大连", "Daqing": "大庆", "Datong": "大同",
+    "Dongguan": "东莞", "Ezhou": "鄂州", "Foshan": "佛山", "Fuyang": "阜阳",
+    "Fuzhou": "福州", "Ganzhou": "赣州", "Guangzhou": "广州", "Guigang": "贵港",
+    "Guilin": "桂林", "Guiyang": "贵阳", "Haikou": "海口", "Handan": "邯郸",
+    "Hangzhou": "杭州", "Hanzhong": "汉中", "Harbin": "哈尔滨", "Hefei": "合肥",
+    "Hengshui": "衡水", "Hengyang": "衡阳", "Heze": "菏泽", "Hezhou": "贺州",
+    "Hotan": "和田", "Huaibei": "淮北", "Huaihua": "怀化", "Huainan": "淮南",
+    "Huangshan": "黄山", "Huizhou": "惠州", "Hulunbeier": "呼伦贝尔", "Huzhou": "湖州",
+    "Huai": "淮安", "Jian": "吉安", "Luan": "六安",
+    "Jiaxing": "嘉兴", "Jieyang": "揭阳", "Jilin": "吉林", "Jinan": "济南",
+    "Jingdezhen": "景德镇", "Jinhua": "金华", "Jining": "济宁", "Jiujiang": "九江",
+    "Jixi": "鸡西", "Kaifeng": "开封", "Kunming": "昆明", "Lanzhou": "兰州",
+    "Lhasa": "拉萨", "Lianyungang": "连云港", "Liaocheng": "聊城", "Linfen": "临汾",
+    "Linyi": "临沂", "Lishui": "丽水", "Liuzhou": "柳州", "Longyan": "龙岩",
+    "Luoyang": "洛阳", "Luzhou": "泸州", "Maoming": "茂名", "Mianyang": "绵阳",
+    "Mudanjiang": "牡丹江", "Nanchang": "南昌", "Nanchong": "南充", "Nanjing": "南京",
+    "Nanning": "南宁", "Nanping": "南平", "Nantong": "南通", "Nanyang": "南阳",
+    "Ningbo": "宁波", "Pingliang": "平凉", "Putian": "莆田", "Puyang": "濮阳",
+    "Qingdao": "青岛", "Quanzhou": "泉州", "Quzhou": "衢州", "Rizhao": "日照",
+    "Sanming": "三明", "Shangqiu": "商丘", "Shangrao": "上饶", "Shantou": "汕头",
+    "Shaoxing": "绍兴", "Shaoyang": "邵阳", "Shenyang": "沈阳", "Shenzhen": "深圳",
+    "Shijiazhuang": "石家庄", "Suining": "遂宁", "Suizhou": "随州", "Suqian": "宿迁",
+    "Suzhou": "苏州", "Taiyuan": "太原", "Tangshan": "唐山", "Tongling": "铜陵",
+    "Urumqi": "乌鲁木齐", "Weifang": "潍坊", "Weihai": "威海", "Weinan": "渭南",
+    "Wenzhou": "温州", "Wuhan": "武汉", "Wuhu": "芜湖", "Wuxi": "无锡",
+    "Xiamen": "厦门", "Xiaogan": "孝感", "Xingtai": "邢台", "Xinxiang": "新乡",
+    "Xinyang": "信阳", "Xinyu": "新余", "Xuancheng": "宣城", "Xuchang": "许昌",
+    "Xuzhou": "徐州", "Yaan": "雅安", "Yancheng": "盐城", "Yibin": "宜宾",
+    "Yingtan": "鹰潭", "Yongzhou": "永州", "Zaozhuang": "枣庄", "Zhangzhou": "漳州",
+    "Zhanjiang": "湛江", "Zhengzhou": "郑州", "Zhongshan": "中山", "Zhoukou": "周口",
+    "Zhuzhou": "株洲", "Ziyang": "资阳",
+}
+
+# 自治州/盟拼音 -> 全称
+_REGION_AUTOPREF_PINYIN: dict[str, str] = {
+    "Enshi": "恩施土家族苗族自治州", "Liangshan": "凉山彝族自治州",
+    "Xiangxi": "湘西土家族苗族自治州", "Ili": "伊犁哈萨克自治州",
+    "South Guizhou": "黔南布依族苗族自治州",
+    "Southwest Guizhou": "黔西南布依族苗族自治州",
+}
+_REGION_AUTOPREF_CN = {
+    "恩施": "恩施土家族苗族自治州", "凉山": "凉山彝族自治州",
+    "湘西": "湘西土家族苗族自治州", "伊犁": "伊犁哈萨克自治州",
+    "黔南": "黔南布依族苗族自治州", "黔西南": "黔西南布依族苗族自治州",
+}
+
+# 直辖市的市辖区（按省份拼音消歧，值为中文区名简称）
+_REGION_DISTRICT_PINYIN: dict[str, dict[str, str]] = {
+    "Beijing": {
+        "Changping": "昌平", "Daxing": "大兴", "Fengtai": "丰台", "Haidian": "海淀",
+        "Mentougou": "门头沟", "Chaoyang": "朝阳", "Tongzhou": "通州",
+    },
+    "Shanghai": {
+        "Fengxian": "奉贤", "Hongkou": "虹口", "Huangpu": "黄浦", "Jinshan": "金山",
+        "Pudong New District": "浦东新区", "Songjiang": "松江", "Xuhui": "徐汇",
+        "Yangpu": "杨浦", "Baoshan": "宝山", "Changning": "长宁",
+    },
+    "Tianjin": {"Baodi": "宝坻", "Jinghai": "静海", "Nankai": "南开", "North Star": "北辰"},
+    "Chongqing": {"Beibei": "北碚", "Dadukou": "大渡口", "Kaixian": "开州", "South Bank": "南岸"},
+}
+
+
+def _pb_read_varint(buf: bytes, pos: int) -> tuple[int, int]:
+    result = 0
+    shift = 0
+    while pos < len(buf):
+        byte = buf[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, pos
+        shift += 7
+    return result, pos
+
+
+def parse_extra_buffer_region(blob: Any) -> tuple[str, str, str]:
+    """解析 contact.extra_buffer protobuf，返回 (国家, 省份拼音, 城市拼音)。"""
+    if blob is None:
+        return "", "", ""
+    if isinstance(blob, memoryview):
+        blob = blob.tobytes()
+    if isinstance(blob, str):
+        blob = blob.encode("utf-8", "ignore")
+    if not isinstance(blob, (bytes, bytearray)):
+        return "", "", ""
+    raw = bytes(blob)
+    found: dict[int, str] = {}
+    pos, size = 0, len(raw)
+    while pos < size:
+        key, pos = _pb_read_varint(raw, pos)
+        field, wire_type = key >> 3, key & 7
+        if wire_type == 2:
+            length, pos = _pb_read_varint(raw, pos)
+            value = raw[pos:pos + length]
+            pos += length
+            if field in (5, 6, 7):
+                text = value.decode("utf-8", "ignore").strip()
+                if text and all(ch.isalpha() or ch == " " for ch in text):
+                    found[field] = text
+        elif wire_type == 0:
+            _, pos = _pb_read_varint(raw, pos)
+        elif wire_type == 1:
+            pos += 8
+        elif wire_type == 5:
+            pos += 4
+        else:
+            break
+    return found.get(5, ""), found.get(6, ""), found.get(7, "")
+
+
+def format_contact_region(blob: Any) -> str:
+    """把 extra_buffer 中的地区转为中文短格式，如 '广东 广州'、'北京 海淀'。
+
+    无法识别（含境外、未知拼音）时返回空串。
+    """
+    country, prov_py, city_py = parse_extra_buffer_region(blob)
+    if country and country != "CN":
+        return ""
+    province = _REGION_PROVINCE_PINYIN.get(prov_py)
+    if not province:
+        return ""
+    # 直辖市：第二级是区（也可能直接是直辖市本身）
+    if prov_py in _REGION_DISTRICT_PINYIN and city_py and city_py.lower() != prov_py.lower():
+        district = _REGION_DISTRICT_PINYIN[prov_py].get(city_py)
+        return f"{province} {district}" if district else province
+    if city_py in _REGION_AUTOPREF_PINYIN:
+        return f"{province} {city_py and _autopref_short(city_py)}"
+    if city_py == "Taizhou":
+        # 同音城市按省份消歧：浙江=台州，江苏=泰州
+        city_cn = "台州" if province == "浙江" else "泰州"
+        return f"{province} {city_cn}"
+    if city_py == "Suzhou":
+        # 同音城市按省份消歧：江苏=苏州，安徽=宿州
+        city_cn = "宿州" if province == "安徽" else "苏州"
+        return f"{province} {city_cn}"
+    city = _REGION_CITY_PINYIN.get(city_py)
+    if city:
+        return f"{province} {city}"
+    return province
+
+
+def _autopref_short(city_py: str) -> str:
+    full = _REGION_AUTOPREF_PINYIN.get(city_py, "")
+    return full[:2] if full else ""
+
+
 def contact_other_info(row: sqlite3.Row) -> str:
     fields = [
         ("微信号", ("alias",)),
@@ -941,6 +1263,9 @@ def contact_other_info(row: sqlite3.Row) -> str:
             values = [decode_contact_text(row_value(row, name)) for name in names]
             values = [item for item in values if item]
             value = " ".join(dict.fromkeys(values))
+            # 新版微信无独立地区列，回退解析 extra_buffer protobuf
+            if not value:
+                value = format_contact_region(row_value(row, "extra_buffer"))
         else:
             value = ""
             for name in names:
@@ -1077,6 +1402,297 @@ def export_contact_list(output: Path, contacts: list[ContactEntry]) -> dict[str,
     return {"contacts_exported": len(rows), "contacts_json": str(json_path), "contacts_csv": str(csv_path)}
 
 
+# 省份列表（含直辖市）
+_MERCHANT_PROVINCES = [
+    "北京", "上海", "天津", "重庆",
+    "河北", "山西", "内蒙古", "辽宁", "吉林", "黑龙江",
+    "江苏", "浙江", "安徽", "福建", "江西", "山东",
+    "河南", "湖北", "湖南", "广东", "广西", "海南",
+    "四川", "贵州", "云南", "西藏", "陕西", "甘肃",
+    "青海", "宁夏", "新疆", "香港", "澳门", "台湾",
+]
+_MERCHANT_DIRECT_CITIES = {"北京", "上海", "天津", "重庆"}
+_MERCHANT_DEFAULT_REGION = ("浙江省", "金华市", "义乌市")
+# 省市区下拉框缺少下级时，默认选第一项“市辖区”
+_MERCHANT_DEFAULT_DISTRICT = "市辖区"
+
+
+def _extract_region_from_info(other_info: str) -> str:
+    """从 other_info 中提取地区字符串"""
+    match = re.search(r"地区[:：]\s*(.+?)(?:；|$)", str(other_info or ""))
+    return match.group(1).strip() if match else ""
+
+
+def _extract_merchant_phone(remark: str) -> str:
+    """从备注末尾提取手机号。
+
+    新格式：备注末尾为连续数字（≥7位），如 "新账号 xxxxx 13812345678"。
+    与商品导出（UID 在末尾）不同，商家导出手机号在末尾。
+    """
+    text = str(remark or "").strip()
+    if not text:
+        return ""
+    m = re.search(r"(\d{7,})\s*$", text)
+    return m.group(1) if m else ""
+
+
+def _parse_merchant_region(region: str) -> tuple[str, str, str]:
+    """将地区字符串（如 '广东 广州'、'北京 海淀'、'湖北 恩施'）
+    拆分为带行政区后缀的 (省, 市, 区)；无法解析时返回默认地址。
+
+    仅在无法读取模板 cityData 时作为兜底；正常流程使用
+    resolve_merchant_region() 以系统下拉框真实选项为准。
+    """
+    region = (region or "").strip()
+    if not region:
+        return _MERCHANT_DEFAULT_REGION
+    tokens = region.split()
+    prov = tokens[0]
+    second = tokens[1] if len(tokens) > 1 else ""
+    if prov not in _MERCHANT_PROVINCES:
+        return _MERCHANT_DEFAULT_REGION
+    # 直辖市：省=市=XX市，第二级为区
+    if prov in _MERCHANT_DIRECT_CITIES:
+        if not second:
+            return f"{prov}市", f"{prov}市", _MERCHANT_DEFAULT_DISTRICT
+        district = second if second.endswith("区") else f"{second}区"
+        return f"{prov}市", f"{prov}市", district
+    province_full = _REGION_AUTONOMOUS_SUFFIX.get(prov, f"{prov}省")
+    if not second:
+        # 只有省份，不足以定位城市，回退默认
+        return _MERCHANT_DEFAULT_REGION
+    # 自治州用全称，其余补“市”；区缺省默认下拉第一项“市辖区”
+    city_full = _REGION_AUTOPREF_CN.get(second, f"{second}市")
+    return province_full, city_full, _MERCHANT_DEFAULT_DISTRICT
+
+
+class _RegionMap:
+    """商家导入模板 cityData 的省市区联动数据。"""
+
+    def __init__(
+        self,
+        provinces: list[str],
+        province_cities: dict[str, list[str]],
+        city_districts: dict[str, list[str]],
+    ) -> None:
+        self.provinces = provinces
+        self.province_cities = province_cities
+        self.city_districts = city_districts
+
+
+def load_merchant_region_map(template_path: "str | Path") -> "_RegionMap | None":
+    """从模板 cityData sheet 读取省/市/区可选项。
+
+    布局：A 列行2起为省名顺序；B 列起每列一个省（行1省名、行2起市名），
+    省列之后每列一个市（行1市名、行2起区县名）。
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        return None
+    path = Path(template_path)
+    if not path.exists():
+        return None
+    try:
+        wb = load_workbook(str(path), data_only=True)
+        if "cityData" not in wb.sheetnames:
+            return None
+        ws = wb["cityData"]
+        max_r, max_c = ws.max_row or 0, ws.max_column or 0
+        # 一次性读取全部单元格（cityData 很小，约 36 行 × 400 列）
+        grid = [[ws.cell(r, c).value for c in range(1, max_c + 1)] for r in range(1, max_r + 1)]
+        prov_order = [row[0] for row in grid[1:]]
+        prov_order = [p for p in prov_order if p]
+
+        province_cities: dict[str, list[str]] = {}
+        city_districts: dict[str, list[str]] = {}
+        idx = 0
+        city_zone = False
+        for ci in range(1, max_c):  # grid 列下标，0=A 标签列，从 B 开始
+            head = grid[0][ci]
+            if not head:
+                continue
+            values = [grid[ri][ci] for ri in range(1, max_r)]
+            values = [v for v in values if v]
+            if not city_zone and idx < len(prov_order) and head == prov_order[idx]:
+                province_cities[head] = values
+                idx += 1
+                continue
+            city_zone = True
+            city_districts.setdefault(head, values)
+        wb.close()
+        if not province_cities or not city_districts:
+            return None
+        return _RegionMap(prov_order, province_cities, city_districts)
+    except Exception:
+        return None
+
+
+def _split_region_tokens(region: str) -> "tuple[str, str, str] | None":
+    """把 '广东 广州' / '北京 海淀' / '湖北 恩施' 拆为 (省短名, 市短名, 区提示)。
+
+    直辖市第二级是区提示；普通省份第二级是市短名。无法识别返回 None。
+    """
+    tokens = str(region or "").split()
+    if not tokens or tokens[0] not in _MERCHANT_PROVINCES:
+        return None
+    prov = tokens[0]
+    second = tokens[1] if len(tokens) > 1 else ""
+    if prov in _MERCHANT_DIRECT_CITIES:
+        return prov, prov, second
+    return prov, second, ""
+
+
+def resolve_merchant_region(region: str, region_map: "_RegionMap | None") -> tuple[str, str, str]:
+    """以模板 cityData 的真实可选项为准解析 (省, 市, 区)。
+
+    - 省/市按短名前缀匹配系统全名，匹配不到则取该下拉框第一项；
+    - 区：直辖市若能从资料定位到具体区则保留（须在可选列表中），
+      否则一律取该市下拉框第一项（不同城市第一项可能是“市辖区/东城区/万州区”等）；
+    - 无地区/境外/无法定位：默认 浙江省 金华市 义乌市。
+    """
+    if region_map is None:
+        return _parse_merchant_region(region)
+    tokens = _split_region_tokens(region)
+    if tokens is None:
+        return _MERCHANT_DEFAULT_REGION
+    prov_short, city_short, district_hint = tokens
+
+    # 省：短名 -> 系统全名（内蒙古->内蒙古自治区 等）
+    prov_full = next(
+        (p for p in region_map.provinces if p == prov_short or p.startswith(prov_short)),
+        "",
+    )
+    if not prov_full:
+        return _MERCHANT_DEFAULT_REGION
+
+    cities = region_map.province_cities.get(prov_full) or [prov_full]
+    # 市：短名前缀匹配（恩施 -> 恩施土家族苗族自治州）；失败取第一项
+    city_full = ""
+    if city_short:
+        city_full = next(
+            (c for c in cities if c == city_short or c.startswith(city_short)),
+            "",
+        )
+    if not city_full:
+        city_full = prov_full if prov_full in cities else cities[0]
+
+    # 区：优先用资料中的区提示（需在可选列表内），否则取第一项
+    districts = region_map.city_districts.get(city_full) or []
+    district = ""
+    if district_hint:
+        hint = district_hint
+        if not hint.endswith(("区", "县", "市", "旗")):
+            hint = f"{hint}区"
+        district = next(
+            (d for d in districts if d == hint or d.startswith(district_hint)),
+            "",
+        )
+    if not district and districts:
+        district = districts[0]
+    return prov_full, city_full, district
+
+
+
+def _extract_wechat_id(other_info: str) -> str:
+    """从 other_info 中提取微信号（可用于添加好友的 ID）"""
+    match = re.search(r"微信号[:：]\s*([^；;]+)", str(other_info or ""))
+    return match.group(1).strip() if match else ""
+
+
+def _strip_phone_from_text(text: str) -> str:
+    """去除文本中的手机号"""
+    return _PHONE_RE.sub("", str(text or "")).strip()
+
+
+def export_merchant_list(
+    output: Path,
+    contacts: list[ContactEntry],
+    prefix: str,
+    template_path: str = "",
+) -> dict[str, Any]:
+    """按备注关键词筛选好友，导出为商家导入模板格式的 Excel。
+
+    列：商家名称(微信昵称)、手机号(备注中解析)、微信号(从other_info提取)、省、市、区。
+    不排序，保持好友列表原始顺序。
+    """
+    import shutil
+
+    # 定位模板文件（需提前加载 cityData 以保证省市区取系统可选值）
+    project_root = Path(__file__).resolve().parent.parent
+    tpl = Path(template_path).expanduser().resolve() if template_path else project_root / "config" / "商家导入模板.xlsx"
+    region_map = load_merchant_region_map(tpl)
+    if region_map is None:
+        print("  [warning] 未读取到模板 cityData，地区将使用内置兜底规则", flush=True)
+
+    filtered = filter_contacts_by_prefix(contacts, prefix)
+    prefix_desc = f"备注关键词「{prefix}」" if prefix else "全部好友"
+    print(f"  筛选到 {len(filtered)} 位好友（{prefix_desc}）", flush=True)
+
+    # 解析备注字段，收集有效商家记录
+    rows: list[dict] = []
+    skipped = 0
+    for contact in filtered:
+        phone = _extract_merchant_phone(contact.remark)
+        if not phone:
+            skipped += 1
+            continue
+        province, city, district = resolve_merchant_region(
+            _extract_region_from_info(contact.other_info), region_map
+        )
+        # 商家名称：从昵称中剥离手机号，若昵称为空则用备注
+        raw_name = contact.nickname or contact.remark or contact.username
+        merchant_name = _strip_phone_from_text(raw_name) or raw_name
+        # 微信号：优先从 other_info 提取，没有则用 wxid
+        wechat_id = _extract_wechat_id(contact.other_info) or contact.username
+        rows.append({
+            "商家名称": merchant_name,
+            "手机号": phone,
+            "微信号": wechat_id,
+            "省": province,
+            "市": city,
+            "区": district,
+        })
+    if skipped:
+        print(f"  跳过 {skipped} 位无手机号的好友", flush=True)
+
+    try:
+        from openpyxl import load_workbook, Workbook
+        from openpyxl.styles import Alignment, Font
+    except ImportError:
+        print("  未安装 openpyxl，已跳过商家导入表格生成", flush=True)
+        return {"merchant_exported": 0}
+
+    if tpl.exists():
+        out_path = output / "商家导入.xlsx"
+        shutil.copy(tpl, out_path)
+        wb = load_workbook(out_path)
+        ws = wb["商家导入"] if "商家导入" in wb.sheetnames else wb.active
+        # 清除模板中可能存在的示例数据行（保留表头）
+        if ws.max_row > 1:
+            ws.delete_rows(2, ws.max_row - 1)
+    else:
+        # 无模板则新建
+        out_path = output / "商家导入.xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "商家导入"
+        ws.append(["商家名称", "手机号", "微信号", "省", "市", "区"])
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+
+    for row in rows:
+        ws.append([row["商家名称"], row["手机号"], row["微信号"], row["省"], row["市"], row["区"]])
+
+    for r in ws.iter_rows(min_row=2):
+        for cell in r:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    wb.save(str(out_path))
+    print(f"  已生成商家导入表格：{out_path}（共 {len(rows)} 位商家）", flush=True)
+    return {"merchant_exported": len(rows), "merchant_xlsx": str(out_path)}
+
+
 def build_contact_lookup(contacts: list[ContactEntry]) -> dict[str, list[ContactEntry]]:
     lookup: dict[str, list[ContactEntry]] = {}
     for contact in contacts:
@@ -1087,6 +1703,25 @@ def build_contact_lookup(contacts: list[ContactEntry]) -> dict[str, list[Contact
     return lookup
 
 
+def filter_contacts_by_prefix(contacts: list[ContactEntry], prefix: str) -> list[ContactEntry]:
+    """Return contacts whose remark (备注名) contains the given prefix text.
+
+    Only the remark name is matched; the WeChat nickname is ignored. Matching
+    is case-insensitive and trims surrounding whitespace. This supports
+    matching any part of the remark (e.g. "库存联盟" matches "服装 库存联盟 138...").
+    Empty prefix returns all contacts.
+    """
+    key = normalize_contact_lookup_text(prefix)
+    if not key:
+        return list(contacts)
+    matches: list[ContactEntry] = []
+    for contact in contacts:
+        remark_key = normalize_contact_lookup_text(contact.remark)
+        if key in remark_key:
+            matches.append(contact)
+    return matches
+
+
 def build_contact_display_names(contacts: list[ContactEntry]) -> dict[str, str]:
     out: dict[str, str] = {}
     for contact in contacts:
@@ -1094,6 +1729,80 @@ def build_contact_display_names(contacts: list[ContactEntry]) -> dict[str, str]:
         if contact.username and display:
             out[contact.username] = display
     return out
+
+
+# Human-readable labels for WeChat moments post types.
+POST_TYPE_LABELS: dict[int, str] = {
+    1: "图文",
+    3: "公众号文章",
+    5: "分享链接",
+    7: "朋友圈封面",
+    28: "视频号",
+    42: "音乐/链接卡片",
+}
+
+# Common mainland China mobile pattern; also tolerates spaces/dashes.
+_PHONE_RE = re.compile(r"(?:\+?86[\s-]?)?(1[3-9]\d{9})")
+
+
+def post_type_label(type_value: Any) -> str:
+    try:
+        return POST_TYPE_LABELS.get(int(type_value), f"其他({type_value})")
+    except (TypeError, ValueError):
+        return str(type_value or "")
+
+
+def extract_phones(*texts: str) -> list[str]:
+    """Extract unique phone numbers from the given text fragments."""
+    found: list[str] = []
+    for text in texts:
+        if not text:
+            continue
+        for match in _PHONE_RE.finditer(str(text)):
+            number = match.group(1)
+            if number not in found:
+                found.append(number)
+    return found
+
+
+def contact_phone(contact: ContactEntry | None) -> str:
+    if contact is None or not contact.other_info:
+        return ""
+    phones = extract_phones(contact.other_info)
+    return phones[0] if phones else ""
+
+
+# A remark may be structured as "类别 平台名 手机号 UID", e.g. "服装 库存联盟 13800138000 wxid_abc".
+_REMARK_SPLIT_RE = re.compile(r"[\s,，;；、|]+")
+
+
+def parse_remark_fields(remark: str) -> tuple[str, str, str, str]:
+    """Parse (category, platform_name, phone, uid) from a contact remark.
+
+    Expected format: ``类别 平台名 手机号 UID`` (tokens separated by
+    whitespace or common punctuation). The phone number is located by regex;
+    the token immediately following the phone is treated as the UID. Missing
+    fields return empty strings.
+    """
+    if not remark:
+        return "", "", "", ""
+    tokens = [t for t in _REMARK_SPLIT_RE.split(str(remark).strip()) if t]
+    category = tokens[0] if len(tokens) >= 1 else ""
+    platform = tokens[1] if len(tokens) >= 2 else ""
+    phone = ""
+    uid = ""
+    for i, token in enumerate(tokens):
+        if _PHONE_RE.fullmatch(token):
+            phone = token
+            if i + 1 < len(tokens):
+                uid = tokens[i + 1]
+            break
+    # Fallback: if no standalone phone token, try regex over the whole remark.
+    if not phone:
+        match = _PHONE_RE.search(str(remark))
+        if match:
+            phone = match.group(1)
+    return category, platform, phone, uid
 
 
 def display_interaction_name(value: Any, contact_names: dict[str, str]) -> str:
@@ -1232,6 +1941,37 @@ async def format_post_interactions(
     return "\n".join(lines).strip()
 
 
+CONTACT_INPUT_SEPARATORS = re.compile(r"[\r\n,，;；|、]+")
+
+
+def split_contact_inputs(raw: str) -> list[str]:
+    """Split a pasted input into individual contact entries.
+
+    Supports common separators: newlines, half/full-width commas, half/full-
+    width semicolons, pipe, and the Chinese enumeration comma. Whitespace
+    around each piece is trimmed, empty pieces are dropped, and duplicate
+    pieces (case-insensitive) within the same paste are kept only once.
+    Special commands (/me, /enough) are returned as-is without splitting.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    if text in {"/me", "/enough"}:
+        return [text]
+    pieces: list[str] = []
+    seen: set[str] = set()
+    for part in CONTACT_INPUT_SEPARATORS.split(text):
+        piece = part.strip()
+        if not piece:
+            continue
+        key = normalize_contact_lookup_text(piece)
+        if key in seen:
+            continue
+        seen.add(key)
+        pieces.append(piece)
+    return pieces
+
+
 def resolve_contact_input(
     raw: str,
     lookup: dict[str, list[ContactEntry]],
@@ -1257,6 +1997,92 @@ def resolve_contact_input(
     return usernames
 
 
+def ask_friend_filter_mode(cli_value: str = "") -> str:
+    """Determine how to select friends when not exporting only self.
+
+    Returns one of: "all", "prefix", "manual".
+    Honors the provided CLI value when non-empty; otherwise asks
+    interactively. An empty/unknown interactive input defaults to "all".
+    """
+    mode = str(cli_value or "").strip().lower()
+    valid = {"all": "all", "a": "all", "prefix": "prefix", "p": "prefix",
+             "manual": "manual", "m": "manual"}
+    if mode in valid:
+        return valid[mode]
+    while True:
+        raw = input(
+            "请选择好友筛选方式（a=全部好友，p=按备注关键词筛选，"
+            "m=手动逐个选择；回车=a）: "
+        ).strip().lower()
+        if not raw:
+            return "all"
+        if raw in valid:
+            return valid[raw]
+        print("输入无效，请输入 a、p 或 m。", flush=True)
+
+
+def ask_export_type(cli_value: str = "") -> str:
+    """先选导出类型：friends=好友/商家表格，moments=朋友圈商品，default=默认导出。
+
+    默认导出 = 昨天 + 备注含“库存联盟”的朋友圈（图片+清洗后表格），零交互。
+    返回 "friends" / "moments" / "default"。CLI 值非空时直接采用，否则交互询问。
+    """
+    raw = str(cli_value or "").strip().lower()
+    friends_aliases = {"f", "friend", "friends", "contacts", "merchant"}
+    moments_aliases = {"m", "moment", "moments", "sns", "product", "products"}
+    default_aliases = {"d", "default", "默认"}
+    if raw in friends_aliases:
+        return "friends"
+    if raw in moments_aliases:
+        return "moments"
+    if raw in default_aliases:
+        return "default"
+    if raw:
+        # 未知 CLI 值不阻断交互，继续询问
+        pass
+    while True:
+        try:
+            answer = input(
+                "请选择导出类型（d=默认导出：昨天+库存联盟+图片+清洗表格；"
+                "f=好友/商家表格；m=朋友圈商品；回车=d）: "
+            ).strip().lower()
+        except EOFError:
+            return "default"
+        if not answer or answer in default_aliases:
+            return "default"
+        if answer in {"r", "reset"}:
+            raise RestartFlow
+        if answer in {"q", "quit", "exit"}:
+            raise SystemExit(0)
+        if answer in moments_aliases:
+            return "moments"
+        if answer in friends_aliases:
+            return "friends"
+        print("输入无效，请输入 d、f 或 m（r=重置，q=退出）。", flush=True)
+
+
+def resolve_friends_by_prefix(
+    contacts: list[ContactEntry],
+    prefix: str,
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Collect usernames of contacts whose remark (备注名) starts with prefix.
+
+    Only the remark name is matched; the WeChat nickname is ignored. Returns
+    (usernames, friend_inputs) compatible with the existing export flow.
+    Prints the matched contacts so the user can confirm.
+    """
+    matches = filter_contacts_by_prefix(contacts, prefix)
+    if not matches:
+        raise ValueError(f"没有找到备注包含“{prefix}”的好友")
+    usernames = [item.username for item in matches if item.username]
+    friend_inputs = [{"input": f"prefix:{prefix}", "usernames": ",".join(usernames)}]
+    print(f"  按前缀“{prefix}”匹配到 {len(usernames)} 位好友：", flush=True)
+    for item in matches:
+        label = item.remark or item.nickname or item.username
+        print(f"    - {label}（{item.username}）", flush=True)
+    return usernames, friend_inputs
+
+
 def ask_friend_filters(
     account_info: AccountInfo,
     account_dir: Path,
@@ -1272,11 +2098,16 @@ def ask_friend_filters(
     index = 1
     while True:
         if index == 1:
-            raw = input("请输入第1位好友的昵称或备注（回车=所有人）: ").strip()
+            raw = input(
+                "请输入第1位好友的昵称或备注（回车=所有人，可批量粘贴，"
+                "用逗号（, 或，）、分号（; 或；）、顿号（、）、竖线（|）或换行分隔）: "
+            ).strip()
             if not raw:
                 return None, []
         else:
-            raw = input(f"请输入第{index}位好友的昵称或备注（/enough=结束）: ").strip()
+            raw = input(
+                f"请输入第{index}位好友的昵称或备注（/enough=结束，可批量粘贴）: "
+            ).strip()
             if not raw:
                 continue
         if raw == "/enough":
@@ -1284,12 +2115,28 @@ def ask_friend_filters(
                 raise ValueError("还没有选择任何好友")
             return selected_usernames, selected_contacts
 
-        resolved = resolve_contact_input(raw, lookup, account_info, config)
-        for username in resolved:
-            if username not in selected_usernames:
-                selected_usernames.append(username)
-        selected_contacts.append({"input": raw, "usernames": ",".join(resolved)})
-        index += 1
+        pieces = split_contact_inputs(raw)
+        if not pieces:
+            continue
+        failures: list[str] = []
+        added_in_batch = 0
+        for piece in pieces:
+            try:
+                resolved = resolve_contact_input(piece, lookup, account_info, config)
+            except ValueError as exc:
+                failures.append(str(exc))
+                continue
+            for username in resolved:
+                if username not in selected_usernames:
+                    selected_usernames.append(username)
+            selected_contacts.append({"input": piece, "usernames": ",".join(resolved)})
+            added_in_batch += 1
+        if failures:
+            print("以下好友未能匹配，已跳过：", flush=True)
+            for msg in failures:
+                print(f"  - {msg}", flush=True)
+        if added_in_batch:
+            index += added_in_batch
 
 
 async def fetch_remote_image(account_dir: Path, media: dict[str, Any], prefer_thumb: bool) -> tuple[bytes, str, str]:
@@ -1371,6 +2218,110 @@ def mime_to_ext(media_type: str) -> str:
     return _impl(media_type)
 
 
+# ---------------------------------------------------------------------------
+# 二维码检测：先取缩略图（本地缓存优先），用 OpenCV 检测，命中则跳过原图下载
+# 判定标准：能解码出内容才算二维码，降低商品图误判率
+# ---------------------------------------------------------------------------
+_QR_STATE: dict[str, Any] = {"detector": None, "disabled": False, "warned": False}
+
+
+def detect_qrcode(payload: bytes) -> bool:
+    """检测图片字节流是否含可解码的二维码。未安装 opencv 或解码失败时返回 False。"""
+    if not payload or _QR_STATE["disabled"]:
+        return False
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        _QR_STATE["disabled"] = True
+        if not _QR_STATE["warned"]:
+            print(
+                "  [warning] 未安装 opencv-python-headless，二维码检测已禁用（pip install opencv-python-headless）",
+                file=sys.stderr,
+                flush=True,
+            )
+            _QR_STATE["warned"] = True
+        return False
+    try:
+        arr = np.frombuffer(payload, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return False
+        # 大图检测慢且定位点易过密：先缩到 800px 以内再检测，兼顾速度与准确率
+        h, w = img.shape[:2]
+        if max(h, w) > 800:
+            scale = 800.0 / max(h, w)
+            img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        detector = _QR_STATE.get("detector")
+        if detector is None:
+            detector = cv2.QRCodeDetector()
+            _QR_STATE["detector"] = detector
+        data, points, _straight = detector.detectAndDecode(img)
+        if data:
+            return True
+        # 点状/艺术二维码（微信名片码常见）数据区解码失败，但定位点可检出。
+        # 定位点四点须通过几何校验：近正方形（透视容差 25%）+ 面积占比 2%~60%，
+        # 否则条纹/针织纹理会大量误检（实测 5.5% 误杀，校验后 600 张商品图 0 误杀）
+        if points is not None:
+            p = points[0]
+            d2 = [
+                (p[i][0] - p[(i + 1) % 4][0]) ** 2 + (p[i][1] - p[(i + 1) % 4][1]) ** 2
+                for i in range(4)
+            ]
+            if max(d2) <= 1.5625 * (min(d2) + 1e-6):
+                h, w = img.shape[:2]
+                frac = cv2.contourArea(p.astype(np.float32)) / (h * w)
+                if 0.02 <= frac <= 0.6:
+                    return True
+        ok, decoded, _pts, _st = detector.detectAndDecodeMulti(img)
+        return bool(ok and any(decoded))
+    except Exception:
+        return False
+
+
+async def fetch_qrcode_probe_image(
+    account_info: AccountInfo,
+    account_dir: Path,
+    post: dict[str, Any],
+    media: dict[str, Any],
+    *,
+    allow_download: bool,
+) -> bytes:
+    """取用于二维码检测的小图：本地缓存优先，没有再远程取缩略图（约 200px，流量极小）。"""
+    payload, _mt, _source = read_local_image(account_info, account_dir, post, media)
+    if payload:
+        return payload
+    if allow_download:
+        payload, _mt, _source = await fetch_remote_image(account_dir, media, prefer_thumb=True)
+        return payload
+    return b""
+
+
+def should_skip_post_download(post: dict[str, Any], contact_remark: str) -> tuple[bool, str]:
+    """复用清洗规则预判朋友圈是否为商品；非商品则跳过整条图片下载，返回 (是否跳过, 原因)。"""
+    from tools.clean_moments import is_product_record
+
+    image_medias: list[dict[str, Any]] = []
+    for media_raw in post.get("media") or []:
+        media = media_raw if isinstance(media_raw, dict) else {}
+        try:
+            media_type = int(media.get("type") or 0)
+        except Exception:
+            media_type = 0
+        if media_type == MEDIA_TYPE_IMAGE:
+            image_medias.append(media)
+    probe = {
+        "content": str(post.get("contentDesc") or ""),
+        "remark": contact_remark,
+        "images": image_medias,
+        "image_count": len(image_medias),
+    }
+    is_product, reasons, _category = is_product_record(probe)
+    if is_product:
+        return False, ""
+    return True, ",".join(reasons)
+
+
 async def export_markdown(
     account_info: AccountInfo,
     account_dir: Path,
@@ -1381,11 +2332,17 @@ async def export_markdown(
     config: dict[str, Any],
     keep_interactions: bool,
     contact_names: dict[str, str],
+    contact_lookup: dict[str, ContactEntry] | None = None,
     *,
     allow_download: bool,
+    skip_non_product: bool = False,
+    skip_qrcode: bool = False,
+    write_markdown: bool = True,
 ) -> tuple[dict[str, Any], list[ExportedPost]]:
     figure = output / "figure"
     figure.mkdir(parents=True, exist_ok=True)
+    # 每批导出重置二维码检测器状态：同进程内补装 opencv 后下一批即可生效
+    _QR_STATE["disabled"] = False
     posts = load_timeline(account_dir, usernames, source="auto")
     filtered: list[dict[str, Any]] = []
     for post in posts:
@@ -1413,11 +2370,14 @@ async def export_markdown(
         "missing_images": 0,
         "stickers": 0,
         "missing_stickers": 0,
+        "skipped_non_product_posts": 0,
+        "qrcode_images": 0,
         "local_earliest": coverage.get("local_earliest", ""),
         "local_latest": coverage.get("local_latest", ""),
         "coverage_gap_count": len(coverage.get("large_gaps") or []),
     }
     exported_posts: list[ExportedPost] = []
+    moments_records: list[dict[str, Any]] = []
     total = len(filtered)
     for idx, post in enumerate(filtered, 1):
         created = datetime.fromtimestamp(int(post.get("createTime") or 0))
@@ -1437,37 +2397,57 @@ async def export_markdown(
             body = f"{body}\n\n🔗 **链接**：{content_url}" if body else f"🔗 **链接**：{content_url}"
         lines.extend([body, ""])
 
+        # contact 查询前移：预判是否商品需要备注分类兜底
+        contact = (contact_lookup or {}).get(username)
+        contact_remark = contact.remark if contact else ""
+        skip_images = False
+        skip_reason = ""
+        if skip_non_product:
+            skip_images, skip_reason = should_skip_post_download(post, contact_remark)
+            if skip_images:
+                stats["skipped_non_product_posts"] += 1
+
         post_dir = unique_post_dir(figure, created)
         image_index = 0
+        post_qrcode_count = 0
         post_images: list[str] = []
-        for media_raw in post.get("media") or []:
-            media = media_raw if isinstance(media_raw, dict) else {}
-            try:
-                media_type = int(media.get("type") or 0)
-            except Exception as exc:
-                print(f"[warning] {exc}", file=sys.stderr)
-                media_type = 0
-            if media_type != MEDIA_TYPE_IMAGE:
-                continue
-            payload, mt, source = await choose_image(account_info, account_dir, post, media, allow_download=allow_download)
-            if not payload:
-                stats["missing_images"] += 1
-                continue
-            image_index += 1
-            post_dir.mkdir(parents=True, exist_ok=True)
-            name = f"{image_index:02d}{mime_to_ext(mt)}"
-            target = post_dir / name
-            target.write_bytes(payload)
-            rel = target.relative_to(output).as_posix()
-            post_images.append(rel)
-            lines.extend([f"![{time_text} image {image_index}]({rel})", ""])
-            stats["images"] += 1
-            if source.startswith("remote") and "thumb" not in source:
-                stats["original_images"] += 1
-            else:
-                stats["fallback_images"] += 1
+        if not skip_images:
+            for media_raw in post.get("media") or []:
+                media = media_raw if isinstance(media_raw, dict) else {}
+                try:
+                    media_type = int(media.get("type") or 0)
+                except Exception as exc:
+                    print(f"[warning] {exc}", file=sys.stderr)
+                    media_type = 0
+                if media_type != MEDIA_TYPE_IMAGE:
+                    continue
+                if skip_qrcode:
+                    probe_payload = await fetch_qrcode_probe_image(
+                        account_info, account_dir, post, media, allow_download=allow_download
+                    )
+                    if probe_payload and detect_qrcode(probe_payload):
+                        post_qrcode_count += 1
+                        stats["qrcode_images"] += 1
+                        continue
+                payload, mt, source = await choose_image(account_info, account_dir, post, media, allow_download=allow_download)
+                if not payload:
+                    stats["missing_images"] += 1
+                    continue
+                image_index += 1
+                post_dir.mkdir(parents=True, exist_ok=True)
+                name = f"{image_index:02d}{mime_to_ext(mt)}"
+                target = post_dir / name
+                target.write_bytes(payload)
+                rel = target.relative_to(output).as_posix()
+                post_images.append(rel)
+                lines.extend([f"![{time_text} image {image_index}]({rel})", ""])
+                stats["images"] += 1
+                if source.startswith("remote") and "thumb" not in source:
+                    stats["original_images"] += 1
+                else:
+                    stats["fallback_images"] += 1
         interactions = ""
-        if keep_interactions:
+        if keep_interactions and not skip_images:
             interactions = await format_post_interactions(
                 account_info,
                 account_dir,
@@ -1491,8 +2471,56 @@ async def export_markdown(
                 interactions=interactions,
             )
         )
-        print(f"  ({idx}/{total}) {time_text} {display}", flush=True)
-    (output / "moments.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        remark_category, platform_name, remark_phone, remark_uid = parse_remark_fields(contact_remark)
+        text_for_phone = str(post.get("contentDesc") or "")
+        # Phone priority: remark > contact other_info > post body.
+        phone = (
+            remark_phone
+            or contact_phone(contact)
+            or (extract_phones(text_for_phone)[0] if extract_phones(text_for_phone) else "")
+        )
+        # UID priority: remark (after phone) > post username.
+        record_uid = remark_uid or username
+        moments_records.append(
+            {
+                "id": str(post.get("id") or ""),
+                "tid": post.get("tid"),
+                "uid": record_uid,
+                "display_name": display,
+                "remark": contact_remark,
+                "remark_category": remark_category,
+                "platform_name": platform_name,
+                "nickname": contact.nickname if contact else str(post.get("displayName") or ""),
+                "create_time": int(post.get("createTime") or 0),
+                "time_text": time_text,
+                "type": post.get("type"),
+                "category": post_type_label(post.get("type")),
+                "content": str(post.get("contentDesc") or ""),
+                "title": str(post.get("title") or ""),
+                "content_url": str(post.get("contentUrl") or ""),
+                "location": location,
+                "source_name": str(post.get("sourceName") or ""),
+                "images": post_images,
+                "image_count": len(post_images),
+                "images_skipped": skip_reason,
+                "qrcode_images": post_qrcode_count,
+                "likes_count": len(post.get("likes") or []),
+                "comments_count": len(post.get("comments") or []),
+                "phone": phone,
+            }
+        )
+        suffix = ""
+        if skip_images:
+            suffix = f" [非商品-跳过图片: {skip_reason}]"
+        elif post_qrcode_count:
+            suffix = f" [跳过二维码图 x{post_qrcode_count}]"
+        print(f"  ({idx}/{total}) {time_text} {display}{suffix}", flush=True)
+    if write_markdown:
+        (output / "moments.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    (output / "moments.json").write_text(
+        json.dumps(moments_records, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return stats, exported_posts
 
 
@@ -1943,6 +2971,7 @@ async def _main_impl(args: argparse.Namespace) -> int:
     print("欢迎使用 wxMoments 微信朋友圈导出备份工具！\n", flush=True)
     print_input_rules()
 
+    # ---- One-time setup: reused across every export in this session ----
     progress("定位微信并获取密钥")
     try:
         account_info = find_account(config)
@@ -1954,81 +2983,409 @@ async def _main_impl(args: argparse.Namespace) -> int:
     if not re.fullmatch(rf"[0-9a-fA-F]{{{DB_KEY_HEX_LENGTH}}}", key):
         raise ValueError("数据库密钥必须是 64 位十六进制字符串")
 
-    start_raw = ask_input(args.start, "起始时间（格式: 20260606 或 2026-06-06，回车=不限制）", "")
-    end_raw = ask_input(args.end, "终止时间（格式: 20260606 或 2026-06-06，回车=不限制）", "")
-    only_raw = ask_input(args.only_self, "是否只导出自己的朋友圈? y/n", "y")
-    interactions_raw = ask_input(args.keep_interactions, "是否保留点赞评论? y/n", "n")
-    export_contacts_raw = ask_input(args.export_contacts, "是否导出好友列表? y/n", "n")
-    start = parse_datetime(start_raw, end_of_day=False)
-    end = parse_datetime(end_raw, end_of_day=True)
-    only_self = parse_yes_no(only_raw)
-    keep_interactions = parse_yes_no_default_no(interactions_raw)
-    export_contacts_enabled = parse_yes_no_default_no(export_contacts_raw)
-    usernames: list[str] | None = self_username_candidates(account_info, config) if only_self else None
-    friend_inputs: list[dict[str, str]] = []
-    contact_names: dict[str, str] = {}
-    output_root = Path(args.output_root or str(config.get("output_root") or "") or PROJECT_ROOT / "output").expanduser()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output = output_root / timestamp
-    if output.exists():
-        shutil.rmtree(output)
-    output.mkdir(parents=True, exist_ok=True)
-
     progress("解密数据库")
     account_dir = decrypt_databases(account_info, key)
     save_db_key(account_info, account_dir, key)
 
-    contacts: list[ContactEntry] = []
-    if (not only_self) or keep_interactions or export_contacts_enabled:
-        contacts = load_contact_entries(account_dir)
-        write_contact_cache(account_dir, contacts)
-        contact_names = build_contact_display_names(contacts)
-
-    contact_export_meta: dict[str, Any] = {}
-    if export_contacts_enabled:
-        progress("导出好友列表")
-        contact_export_meta = export_contact_list(output, contacts)
-
-    if not only_self:
-        progress("准备好友列表")
-        usernames, friend_inputs = ask_friend_filters(account_info, account_dir, config, contacts)
-
-    params = {
-        "start_time": start_raw,
-        "end_time": end_raw,
-        "only_self": only_self,
-        "keep_interactions": keep_interactions,
-        "export_contacts": export_contacts_enabled,
-        "friend_inputs": friend_inputs,
-    }
-    (output / "params.json").write_text(json.dumps(params, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Contacts are loaded once: friend filtering and interaction name
+    # resolution both rely on them, and re-reading the decrypted contact.db
+    # is cheap enough to always do up front.
+    contacts: list[ContactEntry] = load_contact_entries(account_dir)
+    write_contact_cache(account_dir, contacts)
+    contact_names: dict[str, str] = build_contact_display_names(contacts)
+    contact_lookup: dict[str, ContactEntry] = {c.username: c for c in contacts if c.username}
 
     progress("准备图片")
     await save_image_keys(account_info.account, account_info.wxid_dir, account_info.db_storage_dir)
-    progress("导出朋友圈")
-    stats, exported_posts = await export_markdown(
-        account_info,
-        account_dir,
-        output,
-        start,
-        end,
-        usernames,
-        config,
-        keep_interactions,
-        contact_names,
-        allow_download=not args.no_download,
-    )
-    progress("生成 PDF")
-    html_path = write_pdf_html(output, exported_posts)
-    pdf_path = output / "moments.pdf"
-    try:
-        render_pdf(output, exported_posts, pdf_path)
-    except Exception as exc:
-        raise RuntimeError(f"PDF 生成失败: {exc}。HTML 已生成: {html_path}") from exc
-    result = {"output": str(output), **params, **contact_export_meta, **stats}
-    print(f"\n导出完成：{output}", flush=True)
-    if not args.quiet:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    output_root = Path(args.output_root or str(config.get("output_root") or "") or PROJECT_ROOT / "output").expanduser()
+
+    # ---- Per-export loop: change time range / friends / format without re-decrypting ----
+    use_cli_args = True
+
+    async def run_one_export() -> bool:
+        """执行一次完整导出流程。返回 True=再来一批，False=退出。
+
+        任何输入处输入 r 会抛 RestartFlow；由外层循环捕获后从头再来，
+        避免输错参数或中途报错导致整个程序（缓慢的解密初始化）重启。
+        """
+        nonlocal use_cli_args, account_dir, contacts, contact_names, contact_lookup
+        # 每批开始检查源库是否有更新（启动后新浏览的朋友圈会写入微信源库），
+        # 有更新则重新解密并刷新联系人；无更新则跳过（仅一次 mtime 扫描，秒过）。
+        progress("检查数据库更新")
+        if _source_dbs_newer_than_cached(account_info.db_storage_dir, account_dir):
+            progress("检测到新数据，重新解密数据库")
+            account_dir = decrypt_databases(account_info, key)
+            contacts = load_contact_entries(account_dir)
+            write_contact_cache(account_dir, contacts)
+            contact_names = build_contact_display_names(contacts)
+            contact_lookup = {c.username: c for c in contacts if c.username}
+            print("  数据库已更新，本次导出将包含启动后新浏览的朋友圈", flush=True)
+        # 1) 先选导出类型：默认导出 / 好友商家表格 / 朋友圈商品
+        export_type = ask_export_type(args.export_type if use_cli_args else "")
+
+        friend_inputs: list[dict[str, str]] = []
+        friend_filter_mode = ""
+        prefix = ""
+        start_raw = end_raw = ""
+        start = end = None
+        scope = "friends"
+        keep_interactions = False
+        md_only = False
+        export_excel = False
+        clean_data = False
+        export_contacts_enabled = False
+        export_merchant = False
+        skip_moments = False
+        # 图片下载优化：默认开启，仅在朋友圈商品模式生效；CLI 参数可关闭
+        skip_non_product = True
+        skip_qrcode = True
+        # 清洗第三阶段：图片内容检测（二维码+OCR手机号），默认开启
+        image_inspect = True
+        # 本次实际参与好友/商家导出的联系人（按筛选条件收窄）
+        friend_contacts: list[ContactEntry] = list(contacts)
+
+        if export_type == "friends":
+            # ---- 好友/商家模式：先筛选好友，只出好友/商家表格，不碰朋友圈 ----
+            friend_filter_mode = args.friend_filter_mode if args.friend_filter_mode else "prefix"
+            if friend_filter_mode == "prefix":
+                prefix = ask_input(args.friend_prefix if use_cli_args else "", "请输入备注关键词（例如 服装 或 库存联盟，回车=全部好友）", "")
+            # 简化：好友/商家模式默认同时导出 contacts.csv 和商家导入表，不再交互询问
+            export_contacts_enabled = parse_yes_no(args.export_contacts) if args.export_contacts else True
+            export_merchant = parse_yes_no(args.export_merchant) if args.export_merchant else True
+            skip_moments = True
+            use_cli_args = False
+
+            self_usernames = self_username_candidates(account_info, config)
+            all_friend_usernames = [c.username for c in contacts]
+            progress("准备好友列表")
+            if friend_filter_mode == "prefix" and prefix.strip():
+                friend_contacts = filter_contacts_by_prefix(contacts, prefix)
+                picked_usernames = [c.username for c in friend_contacts if c.username]
+                friend_inputs = [{"input": f"prefix:{prefix}", "usernames": ",".join(picked_usernames)}]
+                print(f"  按关键词“{prefix}”匹配到 {len(friend_contacts)} 位好友", flush=True)
+            elif friend_filter_mode == "manual":
+                picked_usernames, friend_inputs = ask_friend_filters(account_info, account_dir, config, contacts)
+                if picked_usernames is None:
+                    friend_contacts = list(contacts)
+                else:
+                    chosen = set(picked_usernames)
+                    friend_contacts = [c for c in contacts if c.username in chosen]
+            else:
+                friend_contacts = list(contacts)
+                friend_inputs = [{"input": "friends:all", "usernames": ",".join(all_friend_usernames)}]
+            usernames: list[str] | None = [c.username for c in friend_contacts if c.username]
+        else:
+            # ---- 朋友圈商品模式 ----
+            if export_type == "default":
+                # 默认导出：昨天 + 备注含“库存联盟” + 图片 + 清洗后表格，零交互
+                yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+                start_raw = end_raw = yesterday
+                scope = "friends"
+                friend_filter_mode = "prefix"
+                prefix = "库存联盟"
+                keep_interactions = False
+                md_only = True  # 默认导出只要图片+清洗后表格，不生成 PDF
+                export_excel = True
+                clean_data = True
+                use_cli_args = False
+                if args.image_inspect:
+                    image_inspect = parse_yes_no(args.image_inspect)
+                print(f"默认导出：{yesterday} 备注含“库存联盟”的朋友圈（图片+清洗后表格）", flush=True)
+            else:
+                start_raw = ask_input(args.start if use_cli_args else "", "起始时间（格式: 20260606 或 2026-06-06，回车=不限制）", "")
+                end_raw = ask_input(args.end if use_cli_args else "", "终止时间（格式: 20260606 或 2026-06-06，回车=不限制）", "")
+                scope_cli = resolve_scope_from_args(args, use_cli_args=use_cli_args)
+                scope = scope_cli or "friends"  # 默认只导出好友朋友圈，CLI 可覆盖为 self/all
+
+                if scope != "self":
+                    # 简化：默认按前缀筛选，CLI 可覆盖为 all/manual
+                    friend_filter_mode = args.friend_filter_mode if args.friend_filter_mode else "prefix"
+                    if friend_filter_mode == "prefix":
+                        prefix = ask_input(args.friend_prefix if use_cli_args else "", "请输入备注关键词（例如 服装 或 库存联盟，回车=全部好友）", "")
+
+                # 简化：固定选项不再交互询问，CLI 参数可覆盖
+                keep_interactions = parse_yes_no_default_no(args.keep_interactions)
+                md_only = parse_yes_no_default_no(args.md_only)
+                export_excel = parse_yes_no(args.export_excel) if args.export_excel else True
+                clean_data = parse_yes_no_default_no(args.clean_data) if args.clean_data else True
+                if args.skip_non_product:
+                    skip_non_product = parse_yes_no(args.skip_non_product)
+                if args.skip_qrcode:
+                    skip_qrcode = parse_yes_no(args.skip_qrcode)
+                if args.image_inspect:
+                    image_inspect = parse_yes_no(args.image_inspect)
+                use_cli_args = False
+
+            start = parse_datetime(start_raw, end_of_day=False)
+            end = parse_datetime(end_raw, end_of_day=True)
+
+            self_usernames = self_username_candidates(account_info, config)
+            all_friend_usernames = [c.username for c in contacts]
+
+            if scope == "self":
+                usernames = self_usernames
+            elif scope == "friends":
+                progress("准备好友列表")
+                if friend_filter_mode == "all" or (friend_filter_mode == "prefix" and not prefix.strip()):
+                    usernames = list(all_friend_usernames)
+                    friend_inputs = [{"input": "friends:all", "usernames": ",".join(all_friend_usernames)}]
+                elif friend_filter_mode == "prefix":
+                    usernames, friend_inputs = resolve_friends_by_prefix(contacts, prefix)
+                else:
+                    usernames, friend_inputs = ask_friend_filters(account_info, account_dir, config, contacts)
+                    # ask_friend_filters returns None when the user picks "所有人".
+                    if usernames is None:
+                        usernames = list(all_friend_usernames)
+                        friend_inputs = [{"input": "friends:all", "usernames": ",".join(all_friend_usernames)}]
+            else:  # all
+                progress("准备好友列表")
+                if friend_filter_mode == "all" or (friend_filter_mode == "prefix" and not prefix.strip()):
+                    usernames = None  # no filter = self + all friends
+                    friend_inputs = []
+                elif friend_filter_mode == "prefix":
+                    friend_usernames, friend_inputs = resolve_friends_by_prefix(contacts, prefix)
+                    usernames = list(dict.fromkeys(self_usernames + friend_usernames))
+                else:
+                    friend_usernames, friend_inputs = ask_friend_filters(account_info, account_dir, config, contacts)
+                    if friend_usernames is None:
+                        usernames = None
+                    else:
+                        usernames = list(dict.fromkeys(self_usernames + friend_usernames))
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output = output_root / timestamp
+        if output.exists():
+            shutil.rmtree(output)
+        output.mkdir(parents=True, exist_ok=True)
+
+        contact_export_meta: dict[str, Any] = {}
+        if export_contacts_enabled:
+            progress("导出好友列表")
+            contact_export_meta = export_contact_list(output, friend_contacts)
+
+        merchant_export_meta: dict[str, Any] = {}
+        if export_merchant:
+            progress("导出商家导入表格")
+            # friend_contacts 已按筛选条件收窄；prefix 仅用于二次包含匹配（全选手动时为空=不再过滤）
+            merchant_export_meta = export_merchant_list(output, friend_contacts, prefix, args.merchant_template)
+
+        params = {
+            "export_type": export_type,
+            "start_time": start_raw,
+            "end_time": end_raw,
+            "scope": scope,
+            "only_self": scope == "self",
+            "keep_interactions": keep_interactions,
+            "export_contacts": export_contacts_enabled,
+            "md_only": md_only,
+            "export_excel": export_excel,
+            "clean_data": clean_data,
+            "export_merchant": export_merchant,
+            "skip_moments": skip_moments,
+            "skip_non_product": skip_non_product,
+            "skip_qrcode": skip_qrcode,
+            "image_inspect": image_inspect,
+            "friend_filter_mode": friend_filter_mode,
+            "friend_prefix": prefix if friend_filter_mode == "prefix" else "",
+            "friend_inputs": friend_inputs,
+        }
+        (output / "params.json").write_text(json.dumps(params, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        if skip_moments:
+            progress("跳过朋友圈导出（仅好友/商家表格模式）")
+            stats = {"posts_exported": 0, "images_downloaded": 0}
+            exported_posts = []
+        else:
+            # 图片下载前询问：是否做图片内容清洗（识别手机号/二维码）
+            if not args.image_inspect:
+                image_inspect = parse_yes_no(
+                    ask_input(
+                        "",
+                        "图片下载后是否清洗识别手机号（含手机号/二维码的图片将隔离到 quarantine，无图商品剔除，y/n，回车=y）",
+                        "y",
+                    )
+                )
+            if not image_inspect:
+                print("  已关闭图片内容清洗：仅保留下载时的二维码快检", flush=True)
+            progress("导出朋友圈")
+            if scope == "self" and skip_non_product:
+                print(
+                    "  [提示] 当前导出自己朋友圈，非商品预判已开启：生活类动态图片将被跳过下载"
+                    "（如需完整备份可加参数 --skip-non-product n）",
+                    flush=True,
+                )
+            stats, exported_posts = await export_markdown(
+                account_info,
+                account_dir,
+                output,
+                start,
+                end,
+                usernames,
+                config,
+                keep_interactions,
+                contact_names,
+                contact_lookup,
+                allow_download=not args.no_download,
+                skip_non_product=skip_non_product,
+                skip_qrcode=skip_qrcode,
+                write_markdown=not clean_data,
+            )
+            if md_only or clean_data:
+                progress("跳过 PDF 生成（清洗模式仅保留图片+表格）")
+            else:
+                progress("生成 PDF")
+                html_path = write_pdf_html(output, exported_posts)
+                pdf_path = output / "moments.pdf"
+                try:
+                    render_pdf(output, exported_posts, pdf_path)
+                except Exception as exc:
+                    raise RuntimeError(f"PDF 生成失败: {exc}。HTML 已生成: {html_path}") from exc
+
+        if export_excel and not skip_moments and not clean_data:
+            progress("生成 Excel")
+            try:
+                from tools.moments_to_excel import load_records, write_xlsx
+                records = load_records(output / "moments.json")
+                write_xlsx(records, output / "moments.xlsx")
+            except RuntimeError:
+                print("  未安装 openpyxl，已跳过 Excel 生成（可手动运行：pip install openpyxl）", flush=True)
+            except Exception as exc:
+                print(f"  [warning] Excel 生成失败: {exc}", file=sys.stderr, flush=True)
+
+        if clean_data and not skip_moments:
+            progress("清洗数据")
+            try:
+                from tools.clean_moments import (
+                    load_records,
+                    clean_records,
+                    write_xlsx as clean_write_xlsx,
+                    apply_image_inspection,
+                )
+                records = load_records(output / "moments.json")
+                kept, removed = clean_records(records)
+                # 第三阶段：图片内容检测（二维码+OCR手机号），命中图隔离到 quarantine/，
+                # 无图商品整条剔除；表格在其后生成，图片路径与磁盘文件始终一致
+                if image_inspect:
+                    progress("图片内容检测（二维码/手机号）")
+                    kept, removed, img_stats = apply_image_inspection(
+                        kept, removed, output, cache_path=RUNTIME_DIR / "image_inspect_cache.json"
+                    )
+                    if img_stats.get("inspected"):
+                        print(
+                            f"  图片检测: {img_stats['inspected']} 张，"
+                            f"二维码 {img_stats['qrcode']} 张、含手机号 {img_stats['phone']} 张已隔离至 quarantine/，"
+                            f"图片全部违规剔除 {img_stats['records_dropped']} 条",
+                            flush=True,
+                        )
+                clean_write_xlsx(kept, output / "moments_clean.xlsx")
+                print(f"  清洗结果: 原始 {len(records)} 条 → 保留 {len(kept)} 条，剔除 {len(removed)} 条", flush=True)
+                # 只保留清洗后表格 + 其引用的图片：删除被剔除商品的已下载图片
+                kept_images = {
+                    str(img).replace("\\", "/")
+                    for rec in kept
+                    for img in (rec.get("images") or [])
+                }
+                figure_dir = output / "figure"
+                removed_files = 0
+                removed_bytes = 0
+                if figure_dir.is_dir():
+                    for f in sorted(figure_dir.rglob("*")):
+                        if not f.is_file():
+                            continue
+                        if f.relative_to(output).as_posix() not in kept_images:
+                            removed_bytes += f.stat().st_size
+                            f.unlink()
+                            removed_files += 1
+                    # 清理删除后留下的空目录（自底向上）
+                    for d in sorted(
+                        (p for p in figure_dir.rglob("*") if p.is_dir()),
+                        key=lambda p: len(p.parts), reverse=True,
+                    ):
+                        if not any(d.iterdir()):
+                            d.rmdir()
+                # moments.json 是清洗输入，用完即删（md/xlsx/pdf 清洗模式下已不生成，防御性清理）
+                for name in (
+                    "moments.md", "moments.json", "moments.xlsx",
+                    "moments_clean.json", "moments_removed.json",
+                    "moments.pdf", "moments.html", "_moments_pdf.html",
+                ):
+                    (output / name).unlink(missing_ok=True)
+                print(
+                    f"  已清理中间产物，删除冗余图片 {removed_files} 张"
+                    f"（释放 {removed_bytes / 1024 / 1024:.1f} MB），"
+                    f"仅保留清洗后表格与商品图",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"  [warning] 数据清洗失败: {exc}", file=sys.stderr, flush=True)
+
+        result = {"output": str(output), **params, **contact_export_meta, **merchant_export_meta, **stats}
+        print(f"\n导出完成：{output}", flush=True)
+        if not args.quiet:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+
+        # In quiet/automation mode only export once.
+        if args.quiet:
+            return False
+
+        while True:
+            again = input(
+                "\n本次结束。y=再来一批（可改时间/筛选/类型，无需重新解密）；"
+                "r=从头重置；q=退出（回车=q）: "
+            ).strip().lower()
+            if again in {"r", "reset"}:
+                raise RestartFlow
+            if not again or again in {"q", "quit", "exit", "n", "no"}:
+                return False
+            if again in {"y", "yes", "1", "true", "on"}:
+                print("\n" + "=" * 60, flush=True)
+                return True
+            print("输入无效，请输入 y、r 或 q。", flush=True)
+
+    # quiet 自动化模式：只跑一次，错误交给 main() 的外层处理
+    if args.quiet:
+        await run_one_export()
+        return 0
+
+    # 交互模式：出错/重置都不退出进程（解密和密钥准备很慢，避免重复初始化）
+    while True:
+        try:
+            keep_going = await run_one_export()
+        except RestartFlow:
+            print("\n" + "=" * 60 + "\n已重置，回到第一步重新开始。\n" + "=" * 60, flush=True)
+            continue
+        except SystemExit:
+            raise
+        except KeyboardInterrupt:
+            print("\n检测到 Ctrl+C，退出程序。", flush=True)
+            break
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            print(f"\n本次导出失败（程序不会退出）：{exc}", file=sys.stderr, flush=True)
+            if os.environ.get("WXMOMENTS_DEBUG_TRACEBACK", "").strip().lower() in {"1", "true", "yes", "on"}:
+                traceback.print_exc()
+            try:
+                ans = input("按回车回到开头重试，输入 q 退出: ").strip().lower()
+            except EOFError:
+                break
+            if ans in {"q", "quit", "exit"}:
+                break
+            print("\n" + "=" * 60, flush=True)
+            continue
+        except Exception as exc:  # noqa: BLE001 - 交互模式兜底，保证不闪退
+            print(f"\n发生未预期的错误（程序不会退出）：{exc}", file=sys.stderr, flush=True)
+            traceback.print_exc()
+            try:
+                ans = input("按回车回到开头重试，输入 q 退出: ").strip().lower()
+            except EOFError:
+                break
+            if ans in {"q", "quit", "exit"}:
+                break
+            print("\n" + "=" * 60, flush=True)
+            continue
+        if not keep_going:
+            break
+
     return 0
 
 
