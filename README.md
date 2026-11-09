@@ -63,7 +63,7 @@ wxMoments 可以把它们全部下载到你电脑上——**Markdown / HTML / PD
 
 ```bash
 # 1. 下载项目
-git clone https://github.com/claudemt/wxMoments.git
+git clone https://github.com/jhr33/wxtool.git
 cd wxMoments
 
 # 2. 直接双击启动！
@@ -85,7 +85,7 @@ python src/wxmoments.py
 
 ```bash
 # 1. 下载项目
-git clone https://github.com/claudemt/wxMoments.git
+git clone https://github.com/jhr33/wxtool.git
 cd wxMoments
 
 # 2. 终端运行
