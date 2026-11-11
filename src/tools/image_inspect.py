@@ -10,8 +10,8 @@
 - 手机号判定：OCR 文本（去空格/横线后）匹配 1[3-9]\\d{9}
 - OCR 前把长边缩到 _OCR_MAX_SIDE（默认 1280）：RapidOCR 检测默认只放大小图、
   不缩小大图，商品大图会按原分辨率推理；缩放后单图耗时约降一半，手机号仍可识别
-- 2 路线程并行、共享同一份 OCR 引擎：多进程会让每进程的 ONNX Runtime 各自吃满线程，
-  实测反而比串行更慢，故不使用多进程
+- OCR 串行执行：RapidOCR 引擎实例不是线程安全的，多个线程共享同一引擎并发推理会
+  静默丢结果（实测 8 张图 2 线程只命中 3 张、1 线程稳定 8/8），因此固定单线程
 - 结果按 (相对路径,大小) 缓存，重跑同一批不重复检测；内容完全相同的图片只检测一次
 - 依赖缺失时优雅降级：无 opencv 跳过二维码检测，无 rapidocr 跳过手机号检测
 """
@@ -42,8 +42,9 @@ _INIT_DONE = False
 # OCR 输入长边上限：RapidOCR 检测默认 limit_type=min，只会放大小图、不会缩小大图，
 # 商品图动辄 2000px 以上，缩到 1280 后单图耗时约为原来的 1/2，手机号仍可识别。
 _OCR_MAX_SIDE = 1280
-# 共享单引擎的并行线程数：实测 2 路约 1.5x，再加线程收益递减且会与下载抢 CPU。
-_OCR_THREADS = 2
+# 检测线程数固定为 1：RapidOCR 引擎实例非线程安全，共享引擎多线程并发会丢识别结果
+# （实测 2 线程 8 张仅命中 3 张），且本机内存紧张，单线程最稳。
+_OCR_THREADS = 1
 # cv2.QRCodeDetector 非线程安全，按线程复用实例。
 _QR_LOCAL = threading.local()
 
@@ -294,8 +295,7 @@ def inspect_images(
     """批量检测图片，返回 {路径字符串: {"qrcode": bool, "phones": [...], "sample": str}}。
 
     root 用于生成跨批次稳定的缓存键（相对路径+文件大小），缺省退回绝对路径。
-    同进程 _OCR_THREADS 路并行、共享一份 OCR 引擎；多进程会各自加载模型并让
-    每进程的 ONNX Runtime 各自吃满线程，实测比串行更慢，故不采用。
+    单线程串行检测：共享 OCR 引擎并发调用会丢结果，故不用多线程/多进程。
     """
     uniq: list[Path] = []
     seen: set[str] = set()
@@ -359,7 +359,7 @@ def inspect_images(
     print(
         f"  图片内容检测: {total} 张待检测（缓存命中 {len(results)} 张"
         + (f"，内容重复 {duplicated} 张" if duplicated else "")
-        + f"），{_OCR_THREADS} 路并行",
+        + (f"），{_OCR_THREADS} 路并行" if _OCR_THREADS > 1 else "，串行检测"),
         flush=True,
     )
 

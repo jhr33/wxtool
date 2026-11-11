@@ -13,14 +13,11 @@ import shutil
 import sqlite3
 import sys
 import traceback
-from collections import deque
 from io import BytesIO
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable
-
-import httpx
+from typing import Any
 
 from wechat_decrypt_tool.modules.constants import (
     MEDIA_TYPE_IMAGE, MEDIA_TYPE_VIDEO, MEDIA_TYPE_LIVE_PHOTO,
@@ -1864,7 +1861,6 @@ async def materialize_comment_stickers(
     stats: dict[str, int],
     *,
     allow_download: bool,
-    client: httpx.AsyncClient | None = None,
 ) -> list[str]:
     rels: list[str] = []
     images = comment.get("images") if isinstance(comment.get("images"), list) else []
@@ -1872,9 +1868,7 @@ async def materialize_comment_stickers(
         media = raw if isinstance(raw, dict) else {}
         if not media:
             continue
-        payload, mt, _source = await choose_image(
-            account_info, account_dir, post, media, allow_download=allow_download, client=client
-        )
+        payload, mt, _source = await choose_image(account_info, account_dir, post, media, allow_download=allow_download)
         if not payload:
             stats["missing_stickers"] = stats.get("missing_stickers", 0) + 1
             continue
@@ -1898,7 +1892,6 @@ async def format_post_interactions(
     stats: dict[str, int],
     *,
     allow_download: bool,
-    client: httpx.AsyncClient | None = None,
 ) -> str:
     lines: list[str] = []
 
@@ -1929,7 +1922,6 @@ async def format_post_interactions(
             comment_index,
             stats,
             allow_download=allow_download,
-            client=client,
         )
         sticker_md = " ".join(f"![表情包]({rel})" for rel in sticker_rels)
         if sticker_md:
@@ -2147,13 +2139,7 @@ def ask_friend_filters(
             index += added_in_batch
 
 
-async def fetch_remote_image(
-    account_dir: Path,
-    media: dict[str, Any],
-    prefer_thumb: bool,
-    *,
-    client: httpx.AsyncClient | None = None,
-) -> tuple[bytes, str, str]:
+async def fetch_remote_image(account_dir: Path, media: dict[str, Any], prefer_thumb: bool) -> tuple[bytes, str, str]:
     from wechat_decrypt_tool.modules.sns_media import fix_sns_cdn_url, get_cached_sns_remote_image, try_fetch_and_decrypt_sns_image_remote
 
     raw_url, key, token, is_original = sns_image_source(media, prefer_thumb=prefer_thumb)
@@ -2170,7 +2156,6 @@ async def fetch_remote_image(
         key=str(key or ""),
         token=str(token or ""),
         use_cache=True,
-        client=client,
     )
     if fetched is not None and meets_expected_size(bytes(fetched.payload or b""), str(fetched.media_type or ""), expected):
         return bytes(fetched.payload or b""), str(fetched.media_type or ""), "remote-original" if is_original else "remote-thumb"
@@ -2210,10 +2195,9 @@ async def choose_image(
     media: dict[str, Any],
     *,
     allow_download: bool,
-    client: httpx.AsyncClient | None = None,
 ) -> tuple[bytes, str, str]:
     if allow_download:
-        payload, mt, source = await fetch_remote_image(account_dir, media, prefer_thumb=False, client=client)
+        payload, mt, source = await fetch_remote_image(account_dir, media, prefer_thumb=False)
         if payload:
             return payload, mt, source
     local_payload, local_mt, local_source = read_local_image(account_info, account_dir, post, media)
@@ -2221,7 +2205,7 @@ async def choose_image(
     if local_payload and meets_expected_size(local_payload, local_mt, expected):
         return local_payload, local_mt, local_source
     if allow_download:
-        payload, mt, source = await fetch_remote_image(account_dir, media, prefer_thumb=True, client=client)
+        payload, mt, source = await fetch_remote_image(account_dir, media, prefer_thumb=True)
         if payload:
             return payload, mt, source
     if local_payload:
@@ -2302,14 +2286,13 @@ async def fetch_qrcode_probe_image(
     media: dict[str, Any],
     *,
     allow_download: bool,
-    client: httpx.AsyncClient | None = None,
 ) -> bytes:
     """取用于二维码检测的小图：本地缓存优先，没有再远程取缩略图（约 200px，流量极小）。"""
     payload, _mt, _source = read_local_image(account_info, account_dir, post, media)
     if payload:
         return payload
     if allow_download:
-        payload, _mt, _source = await fetch_remote_image(account_dir, media, prefer_thumb=True, client=client)
+        payload, _mt, _source = await fetch_remote_image(account_dir, media, prefer_thumb=True)
         return payload
     return b""
 
@@ -2339,10 +2322,6 @@ def should_skip_post_download(post: dict[str, Any], contact_remark: str) -> tupl
     return True, ",".join(reasons)
 
 
-_DOWNLOAD_CONCURRENCY = 6  # 同时在途的图片请求数；Wi-Fi/CDN 单 IP 再高容易触发限流
-_DOWNLOAD_WINDOW = 12  # 有序预取窗口：最多提前下载 12 张，占用约几十 MB
-
-
 async def export_markdown(
     account_info: AccountInfo,
     account_dir: Path,
@@ -2359,8 +2338,6 @@ async def export_markdown(
     skip_non_product: bool = False,
     skip_qrcode: bool = False,
     write_markdown: bool = True,
-    client: httpx.AsyncClient | None = None,
-    on_image_saved: Callable[[Path], None] | None = None,
 ) -> tuple[dict[str, Any], list[ExportedPost]]:
     figure = output / "figure"
     figure.mkdir(parents=True, exist_ok=True)
@@ -2402,64 +2379,6 @@ async def export_markdown(
     exported_posts: list[ExportedPost] = []
     moments_records: list[dict[str, Any]] = []
     total = len(filtered)
-
-    # 先按最终顺序收集待下载图片，再开启有限窗口的有序预取：消费端严格按帖子/图片顺序
-    # 落盘，下载最多提前 12 张、6 路并发，输出顺序与统计和串行版完全一致。
-    download_tasks: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    post_skip: dict[int, tuple[bool, str]] = {}
-    for p_idx, post in enumerate(filtered):
-        username = str(post.get("username") or "").strip()
-        contact = (contact_lookup or {}).get(username)
-        contact_remark = contact.remark if contact else ""
-        skip_images, skip_reason = (False, "")
-        if skip_non_product:
-            skip_images, skip_reason = should_skip_post_download(post, contact_remark)
-        post_skip[p_idx] = (skip_images, skip_reason)
-        if skip_images:
-            continue
-        for media_raw in post.get("media") or []:
-            media = media_raw if isinstance(media_raw, dict) else {}
-            try:
-                media_type = int(media.get("type") or 0)
-            except Exception:
-                media_type = 0
-            if media_type == MEDIA_TYPE_IMAGE:
-                download_tasks.append((post, media))
-
-    download_sem = asyncio.Semaphore(_DOWNLOAD_CONCURRENCY)
-
-    async def _fetch_task(post: dict[str, Any], media: dict[str, Any]) -> tuple[bytes, str, str, bool]:
-        async with download_sem:
-            if skip_qrcode:
-                probe_payload = await fetch_qrcode_probe_image(
-                    account_info, account_dir, post, media, allow_download=allow_download, client=client
-                )
-                if probe_payload and detect_qrcode(probe_payload):
-                    return b"", "", "", True
-            payload, mt, source = await choose_image(
-                account_info, account_dir, post, media, allow_download=allow_download, client=client
-            )
-            return payload, mt, source, False
-
-    async def _ordered_downloads() -> AsyncIterator[tuple[bytes, str, str, bool]]:
-        task_iter = iter(download_tasks)
-        pending: deque[asyncio.Task] = deque()
-        try:
-            while True:
-                while len(pending) < _DOWNLOAD_WINDOW:
-                    item = next(task_iter, None)
-                    if item is None:
-                        break
-                    pending.append(asyncio.create_task(_fetch_task(item[0], item[1])))
-                if not pending:
-                    break
-                yield await pending.popleft()
-        finally:
-            for task in pending:
-                task.cancel()
-
-    download_results = _ordered_downloads()
-
     for idx, post in enumerate(filtered, 1):
         created = datetime.fromtimestamp(int(post.get("createTime") or 0))
         time_text = created.strftime("%Y-%m-%d %H:%M:%S")
@@ -2478,11 +2397,15 @@ async def export_markdown(
             body = f"{body}\n\n🔗 **链接**：{content_url}" if body else f"🔗 **链接**：{content_url}"
         lines.extend([body, ""])
 
+        # contact 查询前移：预判是否商品需要备注分类兜底
         contact = (contact_lookup or {}).get(username)
         contact_remark = contact.remark if contact else ""
-        skip_images, skip_reason = post_skip.get(idx - 1, (False, ""))
-        if skip_images:
-            stats["skipped_non_product_posts"] += 1
+        skip_images = False
+        skip_reason = ""
+        if skip_non_product:
+            skip_images, skip_reason = should_skip_post_download(post, contact_remark)
+            if skip_images:
+                stats["skipped_non_product_posts"] += 1
 
         post_dir = unique_post_dir(figure, created)
         image_index = 0
@@ -2498,15 +2421,15 @@ async def export_markdown(
                     media_type = 0
                 if media_type != MEDIA_TYPE_IMAGE:
                     continue
-                try:
-                    payload, mt, source, skipped_qr = await anext(download_results)
-                except StopAsyncIteration:
-                    stats["missing_images"] += 1
-                    continue
-                if skipped_qr:
-                    post_qrcode_count += 1
-                    stats["qrcode_images"] += 1
-                    continue
+                if skip_qrcode:
+                    probe_payload = await fetch_qrcode_probe_image(
+                        account_info, account_dir, post, media, allow_download=allow_download
+                    )
+                    if probe_payload and detect_qrcode(probe_payload):
+                        post_qrcode_count += 1
+                        stats["qrcode_images"] += 1
+                        continue
+                payload, mt, source = await choose_image(account_info, account_dir, post, media, allow_download=allow_download)
                 if not payload:
                     stats["missing_images"] += 1
                     continue
@@ -2515,8 +2438,6 @@ async def export_markdown(
                 name = f"{image_index:02d}{mime_to_ext(mt)}"
                 target = post_dir / name
                 target.write_bytes(payload)
-                if on_image_saved is not None:
-                    on_image_saved(target)
                 rel = target.relative_to(output).as_posix()
                 post_images.append(rel)
                 lines.extend([f"![{time_text} image {image_index}]({rel})", ""])
@@ -2536,7 +2457,6 @@ async def export_markdown(
                 interaction_contact_names,
                 stats,
                 allow_download=allow_download,
-                client=client,
             )
             if interactions:
                 lines.extend([interactions, ""])
@@ -2595,7 +2515,6 @@ async def export_markdown(
         elif post_qrcode_count:
             suffix = f" [跳过二维码图 x{post_qrcode_count}]"
         print(f"  ({idx}/{total}) {time_text} {display}{suffix}", flush=True)
-    await download_results.aclose()
     if write_markdown:
         (output / "moments.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     (output / "moments.json").write_text(
@@ -3296,50 +3215,22 @@ async def _main_impl(args: argparse.Namespace) -> int:
                     "（如需完整备份可加参数 --skip-non-product n）",
                     flush=True,
                 )
-            image_inspector = None
-            # 仅在已开启非商品预判时做后台 OCR：此时下载的图片基本都会进入清洗，
-            # 不会为最终被剔除的非商品图白跑 OCR；关闭预判时仍走清洗阶段检测。
-            if clean_data and image_inspect and skip_non_product:
-                try:
-                    from tools.image_inspect import BackgroundInspector
-
-                    image_inspector = BackgroundInspector(RUNTIME_DIR / "image_inspect_cache.json", output)
-                except Exception as exc:
-                    print(
-                        f"  [warning] 后台图片检测初始化失败，改为清洗阶段检测: {exc}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-            async with httpx.AsyncClient(
-                timeout=15.0,
-                follow_redirects=False,
-                limits=httpx.Limits(
-                    max_connections=_DOWNLOAD_CONCURRENCY + 2,
-                    max_keepalive_connections=_DOWNLOAD_CONCURRENCY,
-                ),
-            ) as download_client:
-                try:
-                    stats, exported_posts = await export_markdown(
-                        account_info,
-                        account_dir,
-                        output,
-                        start,
-                        end,
-                        usernames,
-                        config,
-                        keep_interactions,
-                        contact_names,
-                        contact_lookup,
-                        allow_download=not args.no_download,
-                        skip_non_product=skip_non_product,
-                        skip_qrcode=skip_qrcode,
-                        write_markdown=not clean_data,
-                        client=download_client,
-                        on_image_saved=image_inspector.submit if image_inspector is not None else None,
-                    )
-                finally:
-                    if image_inspector is not None:
-                        image_inspector.close()
+            stats, exported_posts = await export_markdown(
+                account_info,
+                account_dir,
+                output,
+                start,
+                end,
+                usernames,
+                config,
+                keep_interactions,
+                contact_names,
+                contact_lookup,
+                allow_download=not args.no_download,
+                skip_non_product=skip_non_product,
+                skip_qrcode=skip_qrcode,
+                write_markdown=not clean_data,
+            )
             if md_only or clean_data:
                 progress("跳过 PDF 生成（清洗模式仅保留图片+表格）")
             else:
